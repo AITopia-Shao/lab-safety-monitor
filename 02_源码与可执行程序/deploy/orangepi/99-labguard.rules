@@ -1,0 +1,6 @@
+# 给下位机串口固定一个名字 /dev/labguard，程序会优先使用它（不受 ttyUSB0/ttyACM0 编号变化影响）
+# ESP32-S3 原生 USB
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", SYMLINK+="labguard", MODE="0666"
+# 开发板 UART 口常用的 USB 转串口芯片：WCH CH343 / CH340、Silicon Labs CP2102
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", SYMLINK+="labguard", MODE="0666"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="labguard", MODE="0666"

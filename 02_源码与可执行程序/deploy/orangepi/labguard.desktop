@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=LabGuard 实验室安全监测
+Exec=bash __APP_DIR__/deploy/orangepi/start.sh
+X-GNOME-Autostart-enabled=true

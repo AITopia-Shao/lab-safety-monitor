@@ -1,0 +1,31 @@
+# ---- 不上传：大文件与个人信息 ----
+*.mp4
+*报名表*.pdf
+
+# ---- 运行时生成 ----
+runtime/
+**/runtime/
+voice_sd/
+*.db
+*.log
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# ---- 导出的模型（体积大，按需重新导出）----
+*_rknn_model/
+*.onnx
+
+# ---- 系统与编辑器 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+~$*

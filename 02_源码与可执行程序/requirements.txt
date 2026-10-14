@@ -1,0 +1,12 @@
+# 实验室安全事前干预监测系统 依赖清单
+# 目标平台：香橙派 5（RK3588S, Ubuntu 22.04 / Debian 12, Python 3.10/3.11, aarch64）
+# 也可在 Windows / x86 Linux 上开发调试（Python 3.10 ~ 3.12）
+#
+# 香橙派上 NPU 推理还需要安装 rknn-toolkit-lite2（不在 PyPI 上，见 deploy/orangepi/setup.sh）
+
+PySide6>=6.5.0              # 界面（代码会在缺少 PySide6 时自动回退到 PyQt6）
+opencv-python-headless>=4.8.0
+ultralytics>=8.3.0          # 8.3 起支持 RKNN 模型导出与推理
+numpy>=1.24.0,<2.0.0        # numpy<2 没有 Python 3.13 安装包，请使用 3.10~3.12
+pyserial>=3.5
+PyYAML>=6.0

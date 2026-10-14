@@ -1,0 +1,91 @@
+# =====================================================================
+#  实验室安全事前干预监测系统 - 统一配置文件
+#  所有阈值、端口、机位参数都在这里改，不需要改代码。
+#  缺省的项会自动使用 src/config.py 里的默认值。
+# =====================================================================
+
+# ---- 下位机串口（ESP32-S3 / STM32）----
+serial:
+  port: auto            # auto = 自动识别（优先 /dev/labguard 软链接）；也可写 /dev/ttyACM0、COM5
+  baudrate: 115200
+  heartbeat_s: 1.0      # 心跳周期；下位机超过 30 秒收不到心跳会进入兜底保护
+
+# ---- 摄像头 ----
+camera:
+  pano: 0               # 全景（宏观）：整数索引 / /dev/v4l/by-id/... 设备路径 / http(s)/rtsp 地址
+  desk: 0               # 台面（微观）：与 pano 相同时自动进入"单摄复用"模式
+  width: 640
+  height: 480
+  fourcc: MJPG          # USB 摄像头用 MJPG 降低带宽，两路同时接在香橙派上更稳
+
+# ---- 视觉推理 ----
+vision:
+  prefer_format: [rknn, onnx, pt]   # 按顺序寻找 models/ 下的模型；香橙派上优先使用 NPU 的 RKNN 模型
+  imgsz: 640
+  conf: 0.35
+  iou: 0.45
+  device: cpu
+
+# ---- 人员在场判定（PPE 模型的任意一种装备检测都算"有人"）----
+presence:
+  absent_seconds: 15    # 连续这么多秒画面里没有任何人员装备，才判定为"无人值守"
+  recover_seconds: 1.0  # 人回来后，连续检测到这么久才解除"无人值守"，避免抖动
+
+# ---- 视觉违规的时间投票（防止单帧误报）----
+voting:
+  window_s: 3.0         # 统计窗口
+  on_ratio: 0.6         # 窗口内命中帧占比 ≥ 该值 → 确认违规
+  off_ratio: 0.2        # 窗口内命中帧占比 ≤ 该值 → 解除违规
+  min_frames: 4         # 窗口内至少要有这么多帧才做判断
+
+# ---- 疑似伏案（以面部装备框作为头部位置的近似）----
+sleep:
+  head_y_ratio: 0.60    # 头部中心低于画面高度的 60% 视为低头
+  still_seconds: 10     # 低头且基本静止持续这么久 → 疑似伏案
+  max_motion: 0.03      # 静止判定：头部中心的移动幅度（归一化坐标）
+
+# ---- 台面桌边线标定（台面摄像头画面里、靠近操作者的那条桌边）----
+desk:
+  edge_line: [[0.0, 0.92], [1.0, 0.92]]   # 归一化坐标 [x, y]，部署后按实际机位修改
+  edge_margin: 0.06                        # 器皿底部离桌边线小于该距离 → 靠近桌边预警
+
+# ---- 安全规则（状态机）----
+rules:
+  heating_on_c: 50              # 热源表面温度 ≥ 该值视为"正在加热"
+  dry_burn_c: 120               # 热源表面温度 ≥ 该值判定为干烧 → 断电（水在常压下最高约 100℃）
+  rate_c_per_s: 2.0             # 升温速率 ≥ 该值……
+  rate_min_c: 80                # ……且温度 ≥ 该值 → 升温异常预警
+  unattended_heating_cut_s: 60  # 加热中无人值守持续这么多秒 → 断电
+  smoke_raw: 1800               # MQ-2 原始 ADC 读数（0-4095）阈值，需现场标定
+  humidity_high: 80             # 湿度过高告警 %
+  ambient_high_c: 40            # 环境温度过高告警 ℃
+  fallback_ambient_cut_c: 55    # 未接入热源测温时的兜底规则：器皿 + 无人值守 + 环境温度超过该值 → 断电
+  sim_latch_release_s: 10       # 无下位机（模拟模式）时，危险解除后多少秒自动解除断电锁定
+
+# ---- 事件、语音与存储 ----
+events:
+  reminder_s: 30                # 违规持续存在时，每隔多少秒重复语音提醒一次
+  db: runtime/events.db
+  snapshot_dir: runtime/snapshots
+  voice:                        # DFPlayer 的 TF 卡曲目编号（0001.mp3 = 1）
+    ppe_goggles: 1
+    ppe_coat: 2
+    ppe_gloves: 3
+    ppe_mask: 4
+    ppe_headmask: 5
+    eating: 6
+    sleeping: 7
+    edge_risk: 8
+    unattended_heating: 9
+    dry_burn: 10
+    smoke: 11
+    humidity_high: 12
+
+# ---- 远程通知（L2 级别，可选）----
+notify:
+  webhook_url: ""               # 企业微信 / 钉钉群机器人 Webhook；留空则不发送
+  min_level: WARNING
+
+# ---- 演示模式 ----
+demo:
+  allow_ipc_telemetry: true     # 允许 env_controller.py 注入模拟温湿度（只在未连接下位机时生效）；正式部署建议改为 false

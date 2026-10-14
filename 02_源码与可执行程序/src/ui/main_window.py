@@ -1,6 +1,15 @@
 """
-工业新粗野主义风格主监控窗口与遥测展示卡片
+水色像素粗野风 · 主监控窗口
 src/ui/main_window.py
+
+设计语言（沿用原版）：马卡龙水蓝底色 + 柔和靛蓝描边、Zpix 像素字体、无模糊实心硬阴影、
+按下会"塌陷"的机械按键、底部流动海浪。
+本版在此基础上：
+  · 统一色板：遥测卡片从亮黄黑边改为与整体一致的靛蓝体系，状态色（安全/警告/紧急）全局统一
+  · 信息补全：热源温度、烟雾、下位机链路、继电器与断电锁定状态上屏；紧急状态顶部横幅
+  · 事件卡片：视觉违规 / 安全告警自动生成卡片（不再只能手动抓拍），评审结果写回事件库
+  · 香橙派性能：大面板的硬阴影改为自绘（不再使用离屏渲染的 QGraphicsEffect）；
+    海浪只重绘底部波浪带并可配置帧率；样式只在状态变化时更新
 """
 import sys
 import os
@@ -27,6 +36,10 @@ for _cand_root in [_root_dir, os.path.join(_root_dir, "LabSafetyMonitor")]:
                 sys.path.insert(0, _sp)
 
 import math
+import time
+import html
+import platform
+from collections import deque
 import cv2
 import numpy as np
 from datetime import datetime
@@ -39,10 +52,10 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QLabel, QPushButton, QScrollArea, QFrame, QGridLayout, QButtonGroup,
         QFileDialog, QSlider, QGraphicsDropShadowEffect, QDialog, QMessageBox,
-        QDoubleSpinBox, QSpinBox, QLineEdit, QTextEdit, QInputDialog
+        QDoubleSpinBox, QSpinBox, QLineEdit, QTextEdit, QInputDialog, QSizePolicy
     )
     from PySide6.QtGui import (
-        QImage, QPixmap, QFont, QColor, QFontDatabase, QPainter, QPainterPath
+        QImage, QPixmap, QFont, QColor, QFontDatabase, QPainter, QPainterPath, QPen, QCursor
     )
 except ImportError:
     from PyQt6.QtCore import Qt, QThread, pyqtSignal as Signal, QTimer, QDateTime, QRect
@@ -50,12 +63,15 @@ except ImportError:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QLabel, QPushButton, QScrollArea, QFrame, QGridLayout, QButtonGroup,
         QFileDialog, QSlider, QGraphicsDropShadowEffect, QDialog, QMessageBox,
-        QDoubleSpinBox, QSpinBox, QLineEdit, QTextEdit, QInputDialog
+        QDoubleSpinBox, QSpinBox, QLineEdit, QTextEdit, QInputDialog, QSizePolicy
     )
     from PyQt6.QtGui import (
-        QImage, QPixmap, QFont, QColor, QFontDatabase, QPainter, QPainterPath
+        QImage, QPixmap, QFont, QColor, QFontDatabase, QPainter, QPainterPath, QPen, QCursor
     )
 
+from src.config import cfg
+from src.core.events import events
+from src.core.telemetry import telemetry
 from src.hardware.sensor_worker import SensorWorker
 from src.core.state_machine import SafetyStateMachine
 from dual_inference import DualInferenceSystem
@@ -64,6 +80,46 @@ from serial_comm import SerialComm
 # 全局字体配置
 PIXEL_FONT_FAMILY = "monospace"
 ICON_FONT_FAMILY = "monospace"
+
+
+# ==============================================================================
+# 零、 设计令牌（色板）
+# ==============================================================================
+class T:
+    BG = "#E1F5FE"          # 马卡龙水蓝底
+    PAPER = "#FFFFFF"
+    INK = "#3949AB"         # 深靛蓝：标题与正文
+    PRIMARY = "#5C6BC0"     # 柔和靛蓝：描边、阴影、标题栏
+    PRIMARY_SOFT = "#E8EAF6"
+    PRIMARY_MID = "#C5CAE9"
+    CYAN = "#4DD0E1"        # 按下反馈
+    SKY = "#B3E5FC"
+    DIM = "#7986CB"         # 次要文字
+    SAFE = "#00A86B"
+    SAFE_SOFT = "#DDF7EC"
+    WARN = "#F59E0B"
+    WARN_SOFT = "#FFF4D6"
+    DANGER = "#E53950"
+    DANGER_SOFT = "#FFE3E7"
+    SCREEN = "#1A1F3D"      # 视频底色（深靛而非纯黑，更柔和）
+
+
+# 状态 → (主色, 浅底色, 英文徽标, 中文)
+STATE_STYLE = {
+    "NORMAL": (T.SAFE, T.SAFE_SOFT, "SAFE", "正常守护中"),
+    "WARNING": (T.WARN, T.WARN_SOFT, "WARNING", "环境/行为异常"),
+    "CRITICAL": (T.DANGER, T.DANGER_SOFT, "CRITICAL", "紧急处置中"),
+}
+# 事件等级 → (主色, 浅底色, 中文)
+LEVEL_STYLE = {
+    "INFO": (T.DIM, T.PRIMARY_SOFT, "信息"),
+    "NOTICE": (T.PRIMARY, T.PRIMARY_SOFT, "提醒"),
+    "WARNING": (T.WARN, T.WARN_SOFT, "警告"),
+    "CRITICAL": (T.DANGER, T.DANGER_SOFT, "紧急"),
+}
+# 不生成卡片的事件（链路变化、锁定状态等，已在横幅 / 遥测卡片中展示）
+CARD_SKIP_KINDS = {"power_latched", "link", "power_reset", "power_off_ack", "mcu_event",
+                   "vision_offline", "unattended", "model", "system"}
 
 
 def load_pixel_font():
@@ -83,7 +139,6 @@ def load_pixel_font():
 
     for p in search_paths:
         zpix_path = os.path.join(p, "Zpix.ttf")
-        nerd_path = os.path.join(p, "NerdFontSymbols.ttf")
         if os.path.exists(zpix_path):
             fid = QFontDatabase.addApplicationFont(zpix_path)
             if fid != -1:
@@ -112,69 +167,83 @@ def get_qss():
         font-family: '{PIXEL_FONT_FAMILY}', '{ICON_FONT_FAMILY}', 'Noto Sans Mono', 'SimSun', monospace;
         font-weight: bold;
     }}
-    QMainWindow {{
-        background-color: transparent;
+    QMainWindow, QDialog {{
+        background-color: {T.BG};
     }}
     QLabel {{
-        color: #5C6BC0;
-    }}
-    QFrame {{
-        background-color: #FFFFFF;
-        border: 2px solid #5C6BC0;
-        border-radius: 0px;
+        color: {T.INK};
+        background: transparent;
+        border: none;
     }}
     QPushButton {{
-        background-color: #FFFFFF;
-        color: #5C6BC0;
-        border: 2px solid #5C6BC0;
+        background-color: {T.PAPER};
+        color: {T.PRIMARY};
+        border: 2px solid {T.PRIMARY};
         border-radius: 0px;
-        padding: 8px 12px;
-        margin-top: 0px;
-        margin-left: 0px;
-        margin-bottom: 4px;
-        margin-right: 4px;
+        padding: 7px 12px;
+        margin-top: 0px; margin-left: 0px; margin-bottom: 4px; margin-right: 4px;
     }}
     QPushButton:hover {{
-        background-color: #E1F5FE;
+        background-color: {T.BG};
     }}
     QPushButton:checked {{
-        background-color: #5C6BC0;
-        color: #FFFFFF;
-        margin-top: 2px;
-        margin-left: 2px;
-        margin-bottom: 2px;
-        margin-right: 2px;
+        background-color: {T.PRIMARY};
+        color: {T.PAPER};
+        margin-top: 2px; margin-left: 2px; margin-bottom: 2px; margin-right: 2px;
     }}
     QPushButton:pressed {{
-        background-color: #4DD0E1;
-        color: #FFFFFF;
-        margin-top: 4px;
-        margin-left: 4px;
-        margin-bottom: 0px;
-        margin-right: 0px;
+        background-color: {T.CYAN};
+        color: {T.PAPER};
+        margin-top: 4px; margin-left: 4px; margin-bottom: 0px; margin-right: 0px;
+    }}
+    QPushButton:disabled {{
+        background-color: transparent; color: #9FA8DA; border: 2px dashed #9FA8DA;
+    }}
+    QAbstractSpinBox {{
+        background: {T.PAPER}; color: {T.INK};
+        border: 2px solid {T.PRIMARY}; border-radius: 0px; padding: 2px 4px;
+        selection-background-color: {T.PRIMARY_MID};
+    }}
+    QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {{
+        width: 14px; background: {T.PRIMARY_SOFT}; border-left: 2px solid {T.PRIMARY};
+    }}
+    QSlider::groove:horizontal {{
+        height: 8px; background: {T.PRIMARY_SOFT}; border: 2px solid {T.PRIMARY};
+    }}
+    QSlider::sub-page:horizontal {{
+        background: {T.PRIMARY};
+    }}
+    QSlider::handle:horizontal {{
+        width: 12px; margin: -6px 0; background: {T.PAPER}; border: 2px solid {T.PRIMARY};
     }}
     QScrollArea {{
         background-color: transparent;
         border: none;
     }}
     QScrollBar:vertical {{
-        background-color: #FFFFFF;
-        width: 16px;
-        border: 2px solid #5C6BC0;
+        background-color: {T.PAPER};
+        width: 14px;
+        border: 2px solid {T.PRIMARY};
         margin: 0px;
     }}
     QScrollBar::handle:vertical {{
-        background-color: #5C6BC0;
-        min-height: 20px;
+        background-color: {T.PRIMARY};
+        min-height: 24px;
     }}
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
         height: 0px;
     }}
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+        background: none;
+    }}
+    QToolTip {{
+        background: {T.PAPER}; color: {T.INK}; border: 2px solid {T.PRIMARY};
+    }}
     """
 
 
-def apply_hard_shadow(widget, offset_x=4, offset_y=4, color="#5C6BC0"):
-    """纯粹实心的无模糊硬阴影"""
+def apply_hard_shadow(widget, offset_x=4, offset_y=4, color=T.PRIMARY):
+    """纯粹实心的无模糊硬阴影（用于按钮等小控件；大面板请使用自绘的 Card，避免离屏渲染开销）"""
     shadow = QGraphicsDropShadowEffect(widget)
     shadow.setBlurRadius(0)
     shadow.setColor(QColor(color))
@@ -182,152 +251,187 @@ def apply_hard_shadow(widget, offset_x=4, offset_y=4, color="#5C6BC0"):
     widget.setGraphicsEffect(shadow)
 
 
+def _wave_fps() -> int:
+    val = cfg("ui.wave_fps", None)
+    if val is not None:
+        return max(0, int(val))
+    arm = platform.machine().lower() in ("aarch64", "arm64", "armv7l")
+    return 10 if arm else 25
+
+
 # ==============================================================================
-# 一、 工业新粗野主义风格环境遥测面板 (TelemetryCard)
+# 一、 基础组件：自绘硬阴影卡片 / 状态胶囊
 # ==============================================================================
-class TelemetryCard(QFrame):
+class Card(QWidget):
     """
-    符合工业新粗野主义 (Neo-brutalism) 规范的环境遥测面板：
-    - 直角无圆角：border-radius: 0px
-    - 纯黑粗边框：border: 2px solid #000000
-    - 高对比度配色：高饱和工业明黄 (#FFC107)，纯黑粗体
-    - 无模糊纯黑物理硬阴影：box-shadow: 4px 4px 0px 0px #000000
-    - 包含两个高对比度数值标签：温度与湿度，以及绿色 SAFE / 红色 ALERT 状态指示徽标
+    粗野主义卡片：实色面板 + 描边 + 右下实心硬阴影 + 可选左侧色条。
+    阴影在 paintEvent 中直接绘制，不使用 QGraphicsEffect（香橙派上每次重绘都离屏渲染，代价很高）。
+    """
+
+    def __init__(self, parent=None, bg=T.PAPER, border=T.PRIMARY, shadow=T.PRIMARY,
+                 offset=5, border_w=2, accent=None, padding=(12, 10, 12, 10)):
+        super().__init__(parent)
+        self._bg = QColor(bg)
+        self._border = QColor(border)
+        self._shadow = QColor(shadow)
+        self._offset = offset
+        self._bw = border_w
+        self._accent = QColor(accent) if accent else None
+        self._padding = padding
+        self.body = QVBoxLayout(self)
+        self.body.setSpacing(8)
+        self._apply_margins()
+
+    def _apply_margins(self):
+        l, t, r, b = self._padding
+        extra_l = 6 if self._accent is not None else 0
+        self.body.setContentsMargins(l + self._bw + extra_l, t + self._bw,
+                                     r + self._bw + self._offset, b + self._bw + self._offset)
+
+    def set_colors(self, bg=None, border=None, shadow=None, accent=None):
+        if bg:
+            self._bg = QColor(bg)
+        if border:
+            self._border = QColor(border)
+        if shadow:
+            self._shadow = QColor(shadow)
+        if accent:
+            self._accent = QColor(accent)
+            self._apply_margins()
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        o, bw = self._offset, self._bw
+        face = self.rect().adjusted(0, 0, -o, -o)
+        if o > 0:
+            p.fillRect(face.translated(o, o), self._shadow)
+        p.fillRect(face, self._border)
+        inner = face.adjusted(bw, bw, -bw, -bw)
+        p.fillRect(inner, self._bg)
+        if self._accent is not None:
+            p.fillRect(QRect(inner.left(), inner.top(), 6, inner.height()), self._accent)
+        p.end()
+
+
+class Chip(QLabel):
+    """状态胶囊：只在内容或配色变化时更新样式（setStyleSheet 每次都会触发样式重算）"""
+
+    def __init__(self, text="", fg=T.PAPER, bg=T.PRIMARY, border=None, size=12, parent=None):
+        super().__init__(text, parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._size = size
+        self._key = None
+        self.set(text, fg, bg, border)
+
+    def set(self, text, fg, bg, border=None):
+        key = (text, fg, bg, border)
+        if key == self._key:
+            return
+        self._key = key
+        self.setText(text)
+        self.setStyleSheet(
+            f"QLabel {{ color: {fg}; background: {bg}; border: 2px solid {border or bg};"
+            f" font-size: {self._size}px; padding: 2px 8px; }}"
+        )
+
+
+def section_title(text, size=15):
+    lbl = QLabel(f"▌{text}")
+    lbl.setStyleSheet(f"font-size: {size}px; color: {T.PRIMARY}; font-weight: 900;")
+    return lbl
+
+
+# ==============================================================================
+# 二、 环境遥测面板（TelemetryCard）
+# ==============================================================================
+class MetricTile(QWidget):
+    """单个遥测数值块：标题 / 大号数值 / 阈值提示，边框颜色随状态变化"""
+
+    def __init__(self, caption, hint="", parent=None):
+        super().__init__(parent)
+        self._key = None
+        self.setObjectName("MetricTile")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 6, 10, 6)
+        lay.setSpacing(0)
+        self.lbl_caption = QLabel(caption)
+        self.lbl_caption.setStyleSheet(f"font-size: 11px; color: {T.DIM};")
+        self.lbl_value = QLabel("--")
+        self.lbl_value.setStyleSheet(f"font-size: 22px; font-weight: 900; color: {T.INK};")
+        self.lbl_hint = QLabel(hint)
+        self.lbl_hint.setStyleSheet(f"font-size: 10px; color: {T.DIM};")
+        lay.addWidget(self.lbl_caption)
+        lay.addWidget(self.lbl_value)
+        lay.addWidget(self.lbl_hint)
+        self.set_value("--", "idle")
+
+    def set_value(self, text, level="ok", hint=None):
+        self.lbl_value.setText(text)
+        if hint is not None:
+            self.lbl_hint.setText(hint)
+        if level == self._key:
+            return
+        self._key = level
+        border, bg, fg = {
+            "ok": (T.PRIMARY, T.PAPER, T.INK),
+            "idle": (T.PRIMARY_MID, T.PAPER, T.DIM),
+            "warn": (T.WARN, T.WARN_SOFT, "#B45309"),
+            "danger": (T.DANGER, T.DANGER_SOFT, T.DANGER),
+        }[level]
+        self.setStyleSheet(f"QWidget#MetricTile {{ background: {bg}; border: 2px solid {border}; }}")
+        self.lbl_value.setStyleSheet(f"font-size: 22px; font-weight: 900; color: {fg};")
+
+
+class TelemetryCard(Card):
+    """
+    环境遥测面板：环境温度 / 相对湿度 / 热源表面温度 / 烟雾 四个数值块，
+    以及数据来源、综合安全状态、下位机链路、继电器与断电锁定状态。
     """
 
     def __init__(self, parent=None):
-        super().__init__(parent)
+        super().__init__(parent, padding=(12, 8, 12, 8))
         self.init_ui()
 
     def init_ui(self):
-        # 卡片外容器样式：高对比亮黄背景，纯黑 2px 粗边框，直角无圆角
-        self.setStyleSheet("""
-            QFrame#TelemetryCard {
-                background-color: #FFC107;
-                border: 2px solid #000000;
-                border-radius: 0px;
-            }
-        """)
-        self.setObjectName("TelemetryCard")
+        layout = self.body
+        layout.setSpacing(8)
 
-        # 挂载纯黑无模糊物理硬阴影
-        apply_hard_shadow(self, offset_x=4, offset_y=4, color="#000000")
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        self.lbl_title = QLabel("⚡ 多源环境遥测 / TELEMETRY")
+        self.lbl_title.setStyleSheet(f"font-size: 15px; font-weight: 900; color: {T.INK};")
+        self.lbl_mode_badge = Chip("INIT", T.PAPER, T.DIM, size=11)
+        self.lbl_link_badge = Chip("下位机 --", T.DIM, T.PAPER, T.PRIMARY_MID, size=11)
+        self.lbl_relay_badge = Chip("继电器 --", T.DIM, T.PAPER, T.PRIMARY_MID, size=11)
+        self.lbl_status_badge = Chip("SAFE", T.PAPER, T.SAFE, size=13)
+        header.addWidget(self.lbl_title)
+        header.addStretch()
+        header.addWidget(self.lbl_mode_badge)
+        header.addWidget(self.lbl_link_badge)
+        header.addWidget(self.lbl_relay_badge)
+        header.addWidget(self.lbl_status_badge)
+        layout.addLayout(header)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(10)
+        tiles = QHBoxLayout()
+        tiles.setSpacing(10)
+        self.tile_temp = MetricTile("SENSOR A // 环境温度")
+        self.tile_humi = MetricTile("SENSOR B // 相对湿度")
+        self.tile_obj = MetricTile("SENSOR C // 热源表面温度")
+        self.tile_smoke = MetricTile("SENSOR D // 烟雾浓度")
+        for t in (self.tile_temp, self.tile_humi, self.tile_obj, self.tile_smoke):
+            tiles.addWidget(t, stretch=1)
+        layout.addLayout(tiles)
 
-        # --- 顶部标题栏与状态徽标 ---
-        header_layout = QHBoxLayout()
-        header_layout.setSpacing(10)
-
-        self.lbl_title = QLabel("⚡ 工业环境遥测 / TELEMETRY")
-        self.lbl_title.setStyleSheet("""
-            QLabel {
-                color: #000000;
-                font-size: 15px;
-                font-weight: 900;
-                background: transparent;
-                border: none;
-            }
-        """)
-
-        # 模式指示徽标 (硬件在线 / 模拟遥测)
-        self.lbl_mode_badge = QLabel("INIT")
-        self.lbl_mode_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_mode_badge.setStyleSheet("""
-            QLabel {
-                background-color: #000000;
-                color: #FFFFFF;
-                border: 1px solid #000000;
-                border-radius: 0px;
-                font-size: 11px;
-                font-weight: bold;
-                padding: 2px 6px;
-            }
-        """)
-
-        # 核心安全状态徽标 (正常绿色 SAFE / 超标红色 ALERT)
-        self.lbl_status_badge = QLabel("SAFE")
-        self.lbl_status_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_status_badge.setStyleSheet("""
-            QLabel {
-                background-color: #00E676;
-                color: #000000;
-                border: 2px solid #000000;
-                border-radius: 0px;
-                font-size: 13px;
-                font-weight: 900;
-                padding: 3px 12px;
-            }
-        """)
-
-        header_layout.addWidget(self.lbl_title)
-        header_layout.addStretch()
-        header_layout.addWidget(self.lbl_mode_badge)
-        header_layout.addWidget(self.lbl_status_badge)
-        layout.addLayout(header_layout)
-
-        # --- 中部：两个高对比度数值方块 ---
-        values_layout = QHBoxLayout()
-        values_layout.setSpacing(12)
-
-        # 温度显示块
-        self.temp_container = QFrame()
-        self.temp_container.setStyleSheet("""
-            QFrame {
-                background-color: #FFFFFF;
-                border: 2px solid #000000;
-                border-radius: 0px;
-            }
-        """)
-        temp_sub_layout = QVBoxLayout(self.temp_container)
-        temp_sub_layout.setContentsMargins(10, 8, 10, 8)
-        temp_sub_layout.setSpacing(2)
-
-        lbl_temp_header = QLabel("SENSOR A // 温度")
-        lbl_temp_header.setStyleSheet("border: none; background: transparent; font-size: 11px; color: #555555; font-weight: bold;")
-        self.lbl_temp = QLabel("温度: --.- °C")
-        self.lbl_temp.setStyleSheet("border: none; background: transparent; font-size: 20px; font-weight: 900; color: #000000;")
-        temp_sub_layout.addWidget(lbl_temp_header)
-        temp_sub_layout.addWidget(self.lbl_temp)
-
-        # 湿度显示块
-        self.humi_container = QFrame()
-        self.humi_container.setStyleSheet("""
-            QFrame {
-                background-color: #FFFFFF;
-                border: 2px solid #000000;
-                border-radius: 0px;
-            }
-        """)
-        humi_sub_layout = QVBoxLayout(self.humi_container)
-        humi_sub_layout.setContentsMargins(10, 8, 10, 8)
-        humi_sub_layout.setSpacing(2)
-
-        lbl_humi_header = QLabel("SENSOR B // 相对湿度")
-        lbl_humi_header.setStyleSheet("border: none; background: transparent; font-size: 11px; color: #555555; font-weight: bold;")
-        self.lbl_humi = QLabel("湿度: --.- %")
-        self.lbl_humi.setStyleSheet("border: none; background: transparent; font-size: 20px; font-weight: 900; color: #000000;")
-        humi_sub_layout.addWidget(lbl_humi_header)
-        humi_sub_layout.addWidget(self.lbl_humi)
-
-        values_layout.addWidget(self.temp_container, stretch=1)
-        values_layout.addWidget(self.humi_container, stretch=1)
-        layout.addLayout(values_layout)
-
-        # --- 底部提示栏 ---
-        self.lbl_footer = QLabel("联动闭环状态: 继电器供电常通 | 触发阈值: 温度 > 55.0℃ 或 湿度 > 80.0%")
-        self.lbl_footer.setStyleSheet("""
-            QLabel {
-                color: #000000;
-                font-size: 11px;
-                font-weight: bold;
-                background: transparent;
-                border: none;
-            }
-        """)
+        self.lbl_footer = QLabel("")
+        self.lbl_footer.setStyleSheet(f"font-size: 11px; color: {T.INK};")
         layout.addWidget(self.lbl_footer)
+        self._footer_key = None
+
+        # 兼容旧代码中直接访问的属性名
+        self.lbl_temp = self.tile_temp.lbl_value
+        self.lbl_humi = self.tile_humi.lbl_value
 
     def update_telemetry(
         self,
@@ -337,128 +441,140 @@ class TelemetryCard(QFrame):
         is_simulated: bool = False,
         is_external: bool = False,
         status_text: Optional[str] = None,
+        obj_temp: Optional[float] = None,
+        smoke: Optional[int] = None,
+        link_online: Optional[bool] = None,
+        relay_on: Optional[bool] = None,
+        latched: Optional[bool] = None,
+        footer: Optional[str] = None,
+        state: Optional[str] = None,
     ):
-        """更新温湿度遥测数据及徽标状态"""
-        self.lbl_temp.setText(f"温度: {temp:.1f} °C")
-        self.lbl_humi.setText(f"湿度: {humi:.1f} %")
+        """更新遥测数值与徽标。综合状态以状态机为准（state / status_text），不再自行判断阈值。"""
+        amb_high = float(cfg("rules.ambient_high_c", 40.0))
+        humi_high = float(cfg("rules.humidity_high", 80.0))
+        heat_on = float(cfg("rules.heating_on_c", 50.0))
+        dry = float(cfg("rules.dry_burn_c", 120.0))
+        smoke_th = int(cfg("rules.smoke_raw", 1800))
 
-        # 模式徽标
-        if is_external:
-            self.lbl_mode_badge.setText("外部模拟器")
-            self.lbl_mode_badge.setStyleSheet("""
-                background-color: #1A237E; color: #00E676;
-                border: 1px solid #000000; border-radius: 0px;
-                font-size: 11px; font-weight: bold; padding: 2px 6px;
-            """)
-        elif is_simulated:
-            self.lbl_mode_badge.setText("自主模拟")
-            self.lbl_mode_badge.setStyleSheet("""
-                background-color: #212121; color: #FFD54F;
-                border: 1px solid #000000; border-radius: 0px;
-                font-size: 11px; font-weight: bold; padding: 2px 6px;
-            """)
+        self.tile_temp.set_value(f"{temp:.1f} ℃", "warn" if temp > amb_high else "ok", f"告警 > {amb_high:.0f}℃")
+        self.tile_humi.set_value(f"{humi:.1f} %", "warn" if humi > humi_high else "ok", f"告警 > {humi_high:.0f}%")
+        if obj_temp is None:
+            self.tile_obj.set_value("未接入", "idle", "MLX90614 红外测温")
         else:
-            self.lbl_mode_badge.setText("硬件在线")
-            self.lbl_mode_badge.setStyleSheet("""
-                background-color: #000000; color: #FFFFFF;
-                border: 1px solid #000000; border-radius: 0px;
-                font-size: 11px; font-weight: bold; padding: 2px 6px;
-            """)
+            lvl = "danger" if obj_temp >= dry else ("warn" if obj_temp >= heat_on else "ok")
+            tag = "干烧！" if obj_temp >= dry else ("加热中" if obj_temp >= heat_on else "常温")
+            self.tile_obj.set_value(f"{obj_temp:.1f} ℃", lvl, f"{tag} · 干烧 ≥ {dry:.0f}℃")
+        if smoke is None:
+            self.tile_smoke.set_value("未接入", "idle", "MQ-2 未接入或预热中")
+        else:
+            self.tile_smoke.set_value(f"{smoke}", "danger" if smoke >= smoke_th else "ok", f"阈值 {smoke_th}")
 
-        # 状态徽标 (SAFE / ALERT)
-        if is_alert or temp > 55.0 or humi > 80.0:
-            badge_text = status_text if status_text else "ALERT"
-            self.lbl_status_badge.setText(badge_text)
-            self.lbl_status_badge.setStyleSheet("""
-                QLabel {
-                    background-color: #FF1744;
-                    color: #FFFFFF;
-                    border: 2px solid #000000;
-                    border-radius: 0px;
-                    font-size: 13px;
-                    font-weight: 900;
-                    padding: 3px 12px;
-                }
-            """)
-            self.lbl_footer.setText(
-                f"⚠ 警报触发！当前指标超标: 温度 {temp:.1f}℃ / 湿度 {humi:.1f}% | 已联动执行边缘处置"
-            )
+        # 数据来源
+        if not is_simulated:
+            self.lbl_mode_badge.set("硬件实测", T.PAPER, T.INK)
+        elif is_external:
+            self.lbl_mode_badge.set("模拟器注入", T.PAPER, T.PRIMARY)
         else:
-            self.lbl_status_badge.setText("SAFE")
-            self.lbl_status_badge.setStyleSheet("""
-                QLabel {
-                    background-color: #00E676;
-                    color: #000000;
-                    border: 2px solid #000000;
-                    border-radius: 0px;
-                    font-size: 13px;
-                    font-weight: 900;
-                    padding: 3px 12px;
-                }
-            """)
-            self.lbl_footer.setText("联动闭环状态: 继电器供电常通 | 触发阈值: 温度 > 55.0℃ 或 湿度 > 80.0%")
+            self.lbl_mode_badge.set("自主模拟", T.PAPER, T.DIM)
+
+        # 下位机与继电器
+        if link_online:
+            self.lbl_link_badge.set("● 下位机在线", T.SAFE, T.PAPER, T.SAFE)
+        elif link_online is False:
+            self.lbl_link_badge.set("○ 下位机离线", T.DIM, T.PAPER, T.PRIMARY_MID)
+        if latched:
+            self.lbl_relay_badge.set("⛔ 断电锁定", T.PAPER, T.DANGER)
+        elif relay_on is True:
+            self.lbl_relay_badge.set("继电器 闭合", T.INK, T.PAPER, T.PRIMARY)
+        elif relay_on is False:
+            self.lbl_relay_badge.set("继电器 断开", T.DIM, T.PAPER, T.PRIMARY_MID)
+        else:
+            self.lbl_relay_badge.set("继电器 --", T.DIM, T.PAPER, T.PRIMARY_MID)
+
+        # 综合状态
+        if state is None:
+            state = "CRITICAL" if status_text == "CRITICAL" else ("WARNING" if is_alert else "NORMAL")
+        color, soft, badge, _ = STATE_STYLE.get(state, STATE_STYLE["NORMAL"])
+        self.lbl_status_badge.set(badge, T.PAPER, color)
+        self.set_colors(border=color if state != "NORMAL" else T.PRIMARY,
+                        shadow=color if state != "NORMAL" else T.PRIMARY)
+
+        if footer is None:
+            footer = (f"联动阈值：热源 ≥ {dry:.0f}℃ 断电 · 加热无人 {float(cfg('rules.unattended_heating_cut_s', 60)):.0f}s 断电"
+                      f" · 烟雾 ≥ {smoke_th} 断电 · 湿度 > {humi_high:.0f}% 告警")
+        if footer != self._footer_key:
+            self._footer_key = footer
+            self.lbl_footer.setText(footer)
 
 
 # ==============================================================================
-# 二、 底层动画水浪背景
+# 三、 底层动画水浪背景
 # ==============================================================================
 class WaveBackgroundWidget(QWidget):
-    """自定义中心容器：绘制双层持续流动的半透明海浪"""
+    """
+    自定义中心容器：水蓝底 + 像素点阵 + 双层流动的半透明海浪。
+    性能：只重绘底部波浪带（而非整窗），帧率可在 config.yaml → ui.wave_fps 配置（0 = 静止）。
+    """
+
+    BAND_RATIO = 0.70
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.phase = 0.0
         self.anim_timer = QTimer(self)
         self.anim_timer.timeout.connect(self.animate_wave)
-        self.anim_timer.start(30)
+        fps = _wave_fps()
+        if fps > 0:
+            self.anim_timer.start(int(1000 / fps))
+        # 原版每 30ms 前进 0.1；按实际帧间隔等比换算，保证不同帧率下波速一致
+        self._step = 0.1 * (1000.0 / fps) / 30.0 if fps > 0 else 0.0
 
     def animate_wave(self):
-        self.phase += 0.1
-        self.update()
+        self.phase += self._step
+        top = int(self.height() * self.BAND_RATIO)
+        self.update(QRect(0, top, self.width(), self.height() - top))
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        painter.fillRect(self.rect(), QColor("#E1F5FE"))
+        clip = event.rect()
+        painter.fillRect(clip, QColor(T.BG))
 
         spacing = 60
-        offset = (self.phase * 15) % spacing
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(129, 212, 250, 150))
-
-        for x in range(-spacing, self.width() + spacing, spacing):
-            for y in range(-spacing, self.height() + spacing, spacing):
-                painter.drawEllipse(int(x + offset), int(y + offset), 4, 4)
+        painter.setBrush(QColor(129, 212, 250, 120))
+        x0 = clip.left() - clip.left() % spacing
+        y0 = clip.top() - clip.top() % spacing
+        for x in range(x0, clip.right() + spacing, spacing):
+            for y in range(y0, clip.bottom() + spacing, spacing):
+                painter.drawRect(x + 28, y + 28, 4, 4)   # 方形像素点，呼应像素风
 
         w = self.width()
         h = self.height()
-        base_y = h * 0.75
+        base_y = h * 0.82
 
         path1 = QPainterPath()
         path1.moveTo(0, h)
-        for x in range(0, w + 10, 10):
-            y = base_y + math.sin((x / 150.0) - (self.phase * 0.8)) * 30
-            path1.lineTo(x, y)
+        for x in range(0, w + 12, 12):
+            path1.lineTo(x, base_y + math.sin((x / 150.0) - (self.phase * 0.8)) * 26)
         path1.lineTo(w, h)
         path1.closeSubpath()
-        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(129, 212, 250, 150))
         painter.drawPath(path1)
 
         path2 = QPainterPath()
         path2.moveTo(0, h)
-        for x in range(0, w + 10, 10):
-            y = base_y + 20 + math.sin((x / 100.0) + self.phase) * 20
-            path2.lineTo(x, y)
+        for x in range(0, w + 12, 12):
+            path2.lineTo(x, base_y + 18 + math.sin((x / 100.0) + self.phase) * 18)
         path2.lineTo(w, h)
         path2.closeSubpath()
         painter.setBrush(QColor(92, 107, 192, 100))
         painter.drawPath(path2)
+        painter.end()
 
 
 # ==============================================================================
-# 三、 推理与视频流线程
+# 四、 推理与视频流线程
 # ==============================================================================
 class InferenceThread(QThread):
     update_frames_signal = Signal(np.ndarray, np.ndarray, dict, list, int, int, str)
@@ -489,7 +605,7 @@ class InferenceThread(QThread):
 
 
 # ==============================================================================
-# 四、 专家评审模式弹窗 (ReviewDialog)
+# 五、 专家评审模式弹窗 (ReviewDialog)
 # ==============================================================================
 class ReviewDialog(QDialog):
     def __init__(self, parent_gui, initial_index):
@@ -499,51 +615,45 @@ class ReviewDialog(QDialog):
         self.setWindowTitle("大图评审与导出")
         self.setModal(True)
         self.setStyleSheet(parent_gui.styleSheet())
-        self.resize(1000, 500)
+        self.resize(1040, 560)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
 
-        # 顶部导航
-        nav_layout = QHBoxLayout()
+        head = Card(padding=(12, 8, 12, 8))
+        self.lbl_level = Chip("提醒", T.PAPER, T.PRIMARY, size=13)
         self.lbl_title = QLabel()
-        self.lbl_title.setStyleSheet("font-size: 18px;")
-        nav_layout.addStretch()
-        nav_layout.addWidget(self.lbl_title)
-        nav_layout.addStretch()
-        layout.addLayout(nav_layout)
+        self.lbl_title.setStyleSheet(f"font-size: 18px; color: {T.INK};")
+        self.lbl_index = QLabel()
+        self.lbl_index.setStyleSheet(f"font-size: 13px; color: {T.DIM};")
+        row = QHBoxLayout()
+        row.addWidget(self.lbl_level)
+        row.addWidget(self.lbl_title, stretch=1)
+        row.addWidget(self.lbl_index)
+        head.body.addLayout(row)
+        self.lbl_message = QLabel()
+        self.lbl_message.setWordWrap(True)
+        self.lbl_message.setStyleSheet(f"font-size: 13px; color: {T.DIM};")
+        head.body.addWidget(self.lbl_message)
+        layout.addWidget(head)
 
-        # 显示大图
         images_layout = QHBoxLayout()
+        images_layout.setSpacing(14)
         self.lbl1 = QLabel()
-        self.lbl1.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl1.setStyleSheet("border: 2px solid #5C6BC0;")
-        images_layout.addWidget(self.lbl1)
-
         self.lbl2 = QLabel()
-        self.lbl2.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl2.setStyleSheet("border: 2px solid #5C6BC0;")
-        images_layout.addWidget(self.lbl2)
+        for lbl in (self.lbl1, self.lbl2):
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setMinimumSize(480, 360)
+            lbl.setStyleSheet(f"background: {T.SCREEN}; border: 3px solid {T.PRIMARY};")
+            images_layout.addWidget(lbl)
         layout.addLayout(images_layout)
 
-        # 底部按钮
         btn_layout = QHBoxLayout()
-        card_btn_style = """
-        QPushButton {
-            color: #5C6BC0; font-size: 16px; padding: 10px 20px; border: 2px solid #5C6BC0;
-            margin-top:0px; margin-left:0px; margin-bottom:4px; margin-right:4px;
-        }
-        QPushButton:pressed {
-            background-color: #4DD0E1; margin-top:4px; margin-left:4px; margin-bottom:0px; margin-right:0px;
-        }
-        QPushButton:disabled {
-            background-color: #E0E0E0; color: #9E9E9E; border: 2px solid #9E9E9E;
-        }
-        """
-
-        self.btn_prev = QPushButton("上一张")
-        self.btn_next = QPushButton("下一张")
-        self.btn_correct = QPushButton("正确 (计分)")
-        self.btn_wrong = QPushButton("误报 (不计分)")
+        self.btn_prev = QPushButton("◀ 上一张")
+        self.btn_next = QPushButton("下一张 ▶")
+        self.btn_correct = QPushButton("✔ 正确 (计分)")
+        self.btn_wrong = QPushButton("✘ 误报 (不计分)")
         self.btn_export = QPushButton("导出单张")
 
         btn_layout.addWidget(self.btn_prev)
@@ -553,11 +663,10 @@ class ReviewDialog(QDialog):
         btn_layout.addStretch()
         btn_layout.addWidget(self.btn_export)
         btn_layout.addWidget(self.btn_next)
-
+        self.btn_correct.setStyleSheet(f"QPushButton {{ color: {T.SAFE}; border-color: {T.SAFE}; font-size: 15px; padding: 10px 18px; }}")
+        self.btn_wrong.setStyleSheet(f"QPushButton {{ color: {T.DANGER}; border-color: {T.DANGER}; font-size: 15px; padding: 10px 18px; }}")
         for btn in [self.btn_prev, self.btn_next, self.btn_correct, self.btn_wrong, self.btn_export]:
-            btn.setStyleSheet(card_btn_style)
             apply_hard_shadow(btn, 3, 3)
-
         layout.addLayout(btn_layout)
 
         self.btn_prev.clicked.connect(self.on_prev)
@@ -571,28 +680,23 @@ class ReviewDialog(QDialog):
 
     def update_view(self):
         item = self.parent_gui.snapshots[self.current_index]
-        self.lbl_title.setText(
-            f"抓拍时间: {item['time']} ({self.current_index + 1} / {len(self.parent_gui.snapshots)})"
-        )
+        color, _, tag = LEVEL_STYLE.get(item.get("level", "NOTICE"), LEVEL_STYLE["NOTICE"])
+        if item.get("kind") == "manual":
+            tag = "抓拍"
+        self.lbl_level.set(tag, T.PAPER, color)
+        self.lbl_title.setText(f"{item.get('title', '抓拍')}  ·  {item['time']}")
+        self.lbl_index.setText(f"{self.current_index + 1} / {len(self.parent_gui.snapshots)}")
+        self.lbl_message.setText(item.get("message", ""))
 
-        self.lbl1.setPixmap(
-            item['pixmap_pano'].scaled(480, 360, Qt.AspectRatioMode.KeepAspectRatio)
-        )
+        self.lbl1.setPixmap(item['pixmap_pano'].scaled(480, 360, Qt.AspectRatioMode.KeepAspectRatio))
         if not item['pixmap_desk'].isNull():
-            self.lbl2.setPixmap(
-                item['pixmap_desk'].scaled(480, 360, Qt.AspectRatioMode.KeepAspectRatio)
-            )
+            self.lbl2.setPixmap(item['pixmap_desk'].scaled(480, 360, Qt.AspectRatioMode.KeepAspectRatio))
             self.lbl2.show()
         else:
             self.lbl2.hide()
 
-        if item["reviewed"]:
-            self.btn_correct.setEnabled(False)
-            self.btn_wrong.setEnabled(False)
-        else:
-            self.btn_correct.setEnabled(True)
-            self.btn_wrong.setEnabled(True)
-
+        self.btn_correct.setEnabled(not item["reviewed"])
+        self.btn_wrong.setEnabled(not item["reviewed"])
         self.btn_prev.setEnabled(self.current_index > 0)
         self.btn_next.setEnabled(self.current_index < len(self.parent_gui.snapshots) - 1)
 
@@ -626,22 +730,24 @@ class ReviewDialog(QDialog):
 
 
 # ==============================================================================
-# 五、 系统主监控窗口 (MainWindow)
+# 六、 系统主监控窗口 (MainWindow)
 # ==============================================================================
 class MainWindow(QMainWindow):
     """
     实验室安全监控系统主窗口
     集成：
     1. 双路实时监控推流与渲染
-    2. 工业新粗野主义 TelemetryCard 遥测展示
-    3. 边缘状态机多模态安全判定与继电器硬件执行闭环
-    4. 专家盲评与打分机制流水线
+    2. 多源环境遥测面板（环境温湿度 / 热源温度 / 烟雾 / 下位机 / 继电器）
+    3. 边缘状态机多模态安全判定与继电器硬件执行闭环（紧急横幅 + 断电锁定展示）
+    4. 事件卡片自动生成 + 专家评审计分流水线（评审结果写回事件库）
     """
+
+    MAX_CARDS = 50
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("实验室AI视觉守护系统 [工业遥测加强版]")
-        self.resize(1380, 920)
+        self.setWindowTitle("实验室AI视觉守护系统 · 双摄协同 × 多源传感 × 边缘断电闭环")
+        self.resize(1400, 940)
 
         self.setStyleSheet(get_qss())
 
@@ -655,6 +761,15 @@ class MainWindow(QMainWindow):
         self.current_humi = 55.0
         self.latest_chem_items: List[str] = []
         self.latest_unattended: bool = False
+        self.latest_pano = None
+        self.latest_desk = None
+
+        self._feed_seq = 0
+        self._last_log_html = ""
+        self._ui_msgs = deque(maxlen=4)
+        self._last_tele_refresh = 0.0
+        self._banner_blink = False
+        self._banner_key = None
 
         # 初始化后台线程与状态机
         self.inference_thread = InferenceThread()
@@ -666,7 +781,7 @@ class MainWindow(QMainWindow):
         )
         self.state_machine.alert_triggered.connect(self.on_safety_alert)
 
-        # 实例化硬件驱动模块 SensorWorker
+        # 实例化环境遥测线程（串口统一由 SerialComm 管理）
         self.sensor_worker = SensorWorker(
             port="/dev/ttyUSB0", baudrate=9600, timeout=1.0, parent=self
         )
@@ -675,331 +790,286 @@ class MainWindow(QMainWindow):
 
         self.init_ui()
 
+        # 事件卡片拉取（300ms）与紧急横幅闪烁（500ms）
+        self.feed_timer = QTimer(self)
+        self.feed_timer.timeout.connect(self.pull_event_feed)
+        self.feed_timer.start(300)
+        self.banner_timer = QTimer(self)
+        self.banner_timer.timeout.connect(self.refresh_banner)
+        self.banner_timer.start(500)
+
         # 启动线程
         self.inference_thread.start()
         self.sensor_worker.start()
+
+    # ==========================================================================
+    # 界面搭建
+    # ==========================================================================
+    def _video_panel(self, title):
+        card = Card(padding=(0, 0, 0, 0), offset=6)
+        card.body.setSpacing(0)
+        bar = QWidget()
+        bar.setStyleSheet(f"background: {T.PRIMARY};")
+        bar_l = QHBoxLayout(bar)
+        bar_l.setContentsMargins(10, 5, 8, 5)
+        lbl = QLabel(title)
+        lbl.setStyleSheet(f"color: {T.PAPER}; font-size: 15px;")
+        chip = Chip("等待画面", T.PRIMARY, T.PAPER, size=11)
+        bar_l.addWidget(lbl)
+        bar_l.addStretch()
+        bar_l.addWidget(chip)
+        screen = QLabel()
+        screen.setFixedSize(480, 360)
+        screen.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        screen.setStyleSheet(f"background-color: {T.SCREEN}; color: {T.DIM}; font-size: 14px;")
+        screen.setText("NO SIGNAL")
+        card.body.addWidget(bar)
+        card.body.addWidget(screen)
+        return card, screen, chip
 
     def init_ui(self):
         central_widget = WaveBackgroundWidget(self)
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(16)
+        main_layout.setContentsMargins(18, 16, 18, 16)
+        main_layout.setSpacing(10)
 
-        # === 1. 顶部 Header 区 ===
+        # === 1. 顶部 Header ===
         header_layout = QHBoxLayout()
+        header_layout.setSpacing(14)
 
-        lbl_title = QLabel(" 基于双摄协同的实验室安全事前干预监测系统 ")
-        lbl_title.setStyleSheet(
-            "font-size: 24px; background-color: #FFFFFF; border: 3px solid #5C6BC0; padding: 10px; color: #5C6BC0;"
-        )
-        apply_hard_shadow(lbl_title)
+        title_card = Card(padding=(14, 6, 14, 6), offset=5)
+        lbl_title = QLabel("基于双摄协同的实验室安全事前干预监测系统")
+        lbl_title.setStyleSheet(f"font-size: 24px; color: {T.PRIMARY};")
+        lbl_sub = QLabel("宏观行为 × 微观台面 · 多源环境传感 · 边缘断电闭环")
+        lbl_sub.setStyleSheet(f"font-size: 12px; color: {T.DIM};")
+        title_card.body.setSpacing(4)
+        lbl_title.setMinimumHeight(30)
+        title_card.body.addWidget(lbl_title)
+        title_card.body.addWidget(lbl_sub)
 
-        self.lbl_stats = QLabel(" 运行: 00:00:00 | 正常守护中 ")
-        self.lbl_stats.setStyleSheet(
-            "font-size: 15px; background-color: #FFFFFF; border: 3px solid #5C6BC0; padding: 10px;"
-        )
-        apply_hard_shadow(self.lbl_stats)
+        status_card = Card(padding=(12, 6, 12, 6), offset=5)
+        status_row = QHBoxLayout()
+        status_row.setSpacing(10)
+        self.lbl_state_chip = Chip("● SAFE", T.PAPER, T.SAFE, size=15)
+        self.lbl_stats = QLabel(" 运行 00:00:00 | 正常守护中 ")
+        self.lbl_stats.setStyleSheet(f"font-size: 15px; color: {T.INK};")
+        status_row.addWidget(self.lbl_state_chip)
+        status_row.addWidget(self.lbl_stats)
+        status_card.body.addLayout(status_row)
+        self.status_card = status_card
 
-        header_layout.addWidget(lbl_title, stretch=1)
-        header_layout.addStretch()
-        header_layout.addWidget(self.lbl_stats)
+        header_layout.addWidget(title_card, stretch=1)
+        header_layout.addWidget(status_card)
         main_layout.addLayout(header_layout)
+
+        # === 紧急 / 警告横幅（平时隐藏） ===
+        self.alert_banner = QLabel("")
+        self.alert_banner.setWordWrap(True)
+        self.alert_banner.hide()
+        main_layout.addWidget(self.alert_banner)
 
         self.uptime_timer = QTimer(self)
         self.uptime_timer.timeout.connect(self.update_stats)
         self.uptime_timer.start(1000)
 
-        # === 2. 内容区划分 ===
+        # === 2. 内容区 ===
         content_layout = QHBoxLayout()
         content_layout.setSpacing(16)
 
-        # === 左侧：视频区、遥测卡片与控制区 ===
         left_layout = QVBoxLayout()
-        left_layout.setSpacing(14)
+        left_layout.setSpacing(12)
 
-        # 双摄预览区域
         video_layout = QHBoxLayout()
         video_layout.setSpacing(16)
-
-        # Camera A
-        cam_a_container = QFrame()
-        cam_a_layout = QVBoxLayout(cam_a_container)
-        cam_a_layout.setContentsMargins(0, 0, 0, 0)
-        cam_a_layout.setSpacing(0)
-
-        lbl_cam_a_title = QLabel(" 宏观行为监控 (Camera A) ")
-        lbl_cam_a_title.setStyleSheet(
-            "background-color: #5C6BC0; color: #FFFFFF; font-size: 15px; padding: 6px; border: none;"
-        )
-        self.lbl_pano = QLabel()
-        self.lbl_pano.setFixedSize(480, 360)
-        self.lbl_pano.setStyleSheet("background-color: #000000; border: none;")
-        cam_a_layout.addWidget(lbl_cam_a_title)
-        cam_a_layout.addWidget(self.lbl_pano)
-        apply_hard_shadow(cam_a_container)
-
-        # Camera B
-        cam_b_container = QFrame()
-        cam_b_layout = QVBoxLayout(cam_b_container)
-        cam_b_layout.setContentsMargins(0, 0, 0, 0)
-        cam_b_layout.setSpacing(0)
-
-        lbl_cam_b_title = QLabel(" 微观台面监控 (Camera B) ")
-        lbl_cam_b_title.setStyleSheet(
-            "background-color: #5C6BC0; color: #FFFFFF; font-size: 15px; padding: 6px; border: none;"
-        )
-        self.lbl_desk = QLabel()
-        self.lbl_desk.setFixedSize(480, 360)
-        self.lbl_desk.setStyleSheet("background-color: #000000; border: none;")
-        cam_b_layout.addWidget(lbl_cam_b_title)
-        cam_b_layout.addWidget(self.lbl_desk)
-        apply_hard_shadow(cam_b_container)
-
-        video_layout.addWidget(cam_a_container)
-        video_layout.addWidget(cam_b_container)
+        cam_a, self.lbl_pano, self.chip_pano = self._video_panel("宏观行为监控 · Camera A")
+        cam_b, self.lbl_desk, self.chip_desk = self._video_panel("微观台面监控 · Camera B")
+        video_layout.addWidget(cam_a)
+        video_layout.addWidget(cam_b)
         left_layout.addLayout(video_layout)
 
-        # === 核心新增：工业新粗野主义 TelemetryCard 环境遥测面板 ===
         self.telemetry_card = TelemetryCard(self)
         left_layout.addWidget(self.telemetry_card)
 
-        # 下方控制面板与终端输出
         controls_hlayout = QHBoxLayout()
         controls_hlayout.setSpacing(16)
 
-        # 控制面板
-        control_container = QFrame()
-        apply_hard_shadow(control_container)
-        control_layout = QVBoxLayout(control_container)
-
-        # 模型设置
-        lbl_model_set = QLabel("模型设置 (Model Settings)")
-        lbl_model_set.setStyleSheet(
-            "border: none; background: transparent; font-size: 15px; color: #5C6BC0; font-weight: 900;"
-        )
-        control_layout.addWidget(lbl_model_set)
+        # --- 控制面板 ---
+        control_container = Card(padding=(12, 8, 12, 8))
+        control_layout = control_container.body
+        control_layout.setSpacing(6)
+        control_layout.addWidget(section_title("模型设置 · Model Settings"))
 
         model_btn_layout = QHBoxLayout()
         self.btn_model_ppe = QPushButton("人员模型")
         self.btn_model_chem = QPushButton("物品模型")
         self.btn_model_custom = QPushButton("自定义...")
-
-        small_btn_style = """
-            QPushButton {
-                background-color: #E8EAF6; color: #5C6BC0; font-size: 12px; padding: 4px 8px; border: 1px solid #5C6BC0;
-            }
-            QPushButton:pressed { background-color: #C5CAE9; }
-            QPushButton:checked { background-color: #5C6BC0; color: #FFFFFF; }
-        """
-        self.btn_model_custom.setStyleSheet(small_btn_style)
-
+        self.btn_model_custom.setToolTip("加载自己训练的 .pt / .onnx / RKNN 模型，替换人员或物品模型")
+        self.btn_model_custom.setStyleSheet(f"""
+            QPushButton {{ background-color: {T.PRIMARY_SOFT}; color: {T.PRIMARY}; font-size: 12px; padding: 5px 8px; }}
+        """)
         for btn in [self.btn_model_ppe, self.btn_model_chem]:
             btn.setCheckable(True)
             model_btn_layout.addWidget(btn, stretch=2)
-
         model_btn_layout.addWidget(self.btn_model_custom, stretch=1)
         self.btn_model_ppe.setChecked(True)
         self.btn_model_chem.setChecked(True)
         control_layout.addLayout(model_btn_layout)
 
-        # 参数微调
         params_layout = QHBoxLayout()
-        lbl_conf = QLabel("置信度:")
-        lbl_conf.setStyleSheet("border: none; background: transparent; font-size: 12px;")
+        params_layout.setSpacing(6)
         self.spin_conf = QDoubleSpinBox()
-        self.spin_conf.setRange(0.00, 1.00)
+        self.spin_conf.setRange(0.05, 0.95)
         self.spin_conf.setSingleStep(0.05)
-        self.spin_conf.setValue(0.25)
-        self.spin_conf.setStyleSheet("border: 2px solid #5C6BC0; background: #FFF; padding: 2px;")
-
-        lbl_iou = QLabel("IoU阈值:")
-        lbl_iou.setStyleSheet("border: none; background: transparent; font-size: 12px;")
+        self.spin_conf.setValue(float(cfg("vision.conf", 0.35)))
         self.spin_iou = QDoubleSpinBox()
-        self.spin_iou.setRange(0.00, 1.00)
+        self.spin_iou.setRange(0.05, 0.95)
         self.spin_iou.setSingleStep(0.05)
-        self.spin_iou.setValue(0.45)
-        self.spin_iou.setStyleSheet("border: 2px solid #5C6BC0; background: #FFF; padding: 2px;")
-
-        lbl_size = QLabel("图像尺寸:")
-        lbl_size.setStyleSheet("border: none; background: transparent; font-size: 12px;")
+        self.spin_iou.setValue(float(cfg("vision.iou", 0.45)))
         self.spin_size = QSpinBox()
         self.spin_size.setRange(128, 2048)
         self.spin_size.setSingleStep(32)
-        self.spin_size.setValue(640)
-        self.spin_size.setStyleSheet("border: 2px solid #5C6BC0; background: #FFF; padding: 2px;")
-
+        self.spin_size.setValue(int(cfg("vision.imgsz", 640)))
         self.btn_apply_params = QPushButton("确认修改")
-        self.btn_apply_params.setStyleSheet("""
-            QPushButton { background-color: #C8E6C9; color: #2E7D32; font-size: 12px; padding: 4px 8px; border: 1px solid #2E7D32; }
-            QPushButton:pressed { background-color: #A5D6A7; }
+        self.btn_apply_params.setStyleSheet(f"""
+            QPushButton {{ background-color: {T.SAFE_SOFT}; color: {T.SAFE}; border-color: {T.SAFE}; font-size: 12px; padding: 4px 8px; }}
+            QPushButton:pressed {{ background-color: #B9F0D8; }}
         """)
-
-        params_layout.addWidget(lbl_conf)
-        params_layout.addWidget(self.spin_conf)
-        params_layout.addWidget(lbl_iou)
-        params_layout.addWidget(self.spin_iou)
-        params_layout.addWidget(lbl_size)
-        params_layout.addWidget(self.spin_size)
+        for text, w in (("置信度", self.spin_conf), ("IoU", self.spin_iou), ("尺寸", self.spin_size)):
+            lbl = QLabel(text)
+            lbl.setStyleSheet(f"font-size: 12px; color: {T.DIM};")
+            params_layout.addWidget(lbl)
+            params_layout.addWidget(w)
         params_layout.addWidget(self.btn_apply_params)
         control_layout.addLayout(params_layout)
 
-        # 推理模式
-        lbl_infer_mode = QLabel("推理模式 (Inference Mode)")
-        lbl_infer_mode.setStyleSheet(
-            "border: none; background: transparent; font-size: 15px; color: #5C6BC0; font-weight: 900; margin-top: 6px;"
-        )
-        control_layout.addWidget(lbl_infer_mode)
-
+        control_layout.addWidget(section_title("推理模式 · Inference Mode"))
         infer_btn_layout = QHBoxLayout()
         self.btn_infer_camera = QPushButton("单摄模式")
         self.btn_infer_phone = QPushButton("连接手机/副摄")
         self.btn_infer_import = QPushButton("导入媒体")
-        self.btn_infer_camera.setCheckable(True)
-        self.btn_infer_phone.setCheckable(True)
-        self.btn_infer_import.setCheckable(True)
-
-        infer_btn_layout.addWidget(self.btn_infer_camera, stretch=1)
-        infer_btn_layout.addWidget(self.btn_infer_phone, stretch=1)
-        infer_btn_layout.addWidget(self.btn_infer_import, stretch=1)
-
-        self.infer_group = QButtonGroup()
+        for b in (self.btn_infer_camera, self.btn_infer_phone, self.btn_infer_import):
+            b.setCheckable(True)
+            infer_btn_layout.addWidget(b, stretch=1)
+        self.infer_group = QButtonGroup(self)
         self.infer_group.addButton(self.btn_infer_camera, 1)
         self.infer_group.addButton(self.btn_infer_phone, 2)
         self.infer_group.addButton(self.btn_infer_import, 3)
         self.btn_infer_camera.setChecked(True)
         control_layout.addLayout(infer_btn_layout)
 
-        # 导入媒体信息与进度条
         self.media_info_layout = QVBoxLayout()
-        path_layout = QHBoxLayout()
+        self.media_info_layout.setSpacing(4)
         self.lbl_media_path = QLabel("当前媒体: (摄像头直播中)")
-        self.lbl_media_path.setStyleSheet("border: none; background: transparent; color: #757575; font-size: 12px;")
-        path_layout.insertWidget(0, self.lbl_media_path, stretch=1)
-        self.media_info_layout.addLayout(path_layout)
+        self.lbl_media_path.setStyleSheet(f"color: {T.DIM}; font-size: 12px;")
+        self.media_info_layout.addWidget(self.lbl_media_path)
 
         playback_layout = QHBoxLayout()
+        playback_layout.setContentsMargins(0, 0, 0, 0)
         self.btn_play_pause = QPushButton("⏸")
-        self.btn_play_pause.setFixedSize(40, 40)
+        self.btn_play_pause.setFixedSize(40, 38)
         self.slider_progress = QSlider(Qt.Orientation.Horizontal)
         self.lbl_progress = QLabel("Live")
-        self.lbl_progress.setStyleSheet("border: none; background: transparent;")
-
+        self.lbl_progress.setStyleSheet(f"font-size: 12px; color: {T.DIM};")
         playback_layout.addWidget(self.btn_play_pause)
         playback_layout.addWidget(self.slider_progress)
         playback_layout.addWidget(self.lbl_progress)
-
         self.playback_widget = QWidget()
-        self.playback_widget.setStyleSheet("background: transparent; border: none;")
         self.playback_widget.setLayout(playback_layout)
         self.playback_widget.hide()
-
         self.media_info_layout.addWidget(self.playback_widget)
         control_layout.addLayout(self.media_info_layout)
+        control_layout.addStretch()
 
-        # 终端输出区
-        terminal_container = QFrame()
-        apply_hard_shadow(terminal_container)
-        terminal_layout = QVBoxLayout(terminal_container)
-
-        lbl_terminal = QLabel("终端输出 (Terminal)")
-        lbl_terminal.setStyleSheet(
-            "border: none; background: transparent; font-size: 15px; color: #5C6BC0; font-weight: 900;"
-        )
-        terminal_layout.addWidget(lbl_terminal)
-
+        # --- 终端输出 ---
+        terminal_container = Card(padding=(12, 8, 12, 8))
+        terminal_layout = terminal_container.body
+        term_head = QHBoxLayout()
+        term_head.addWidget(section_title("终端输出 · Terminal"))
+        term_head.addStretch()
+        self.lbl_fps = Chip("视觉 --", T.PRIMARY, T.PRIMARY_SOFT, T.PRIMARY_MID, size=11)
+        term_head.addWidget(self.lbl_fps)
+        terminal_layout.addLayout(term_head)
         self.txt_terminal = QTextEdit()
         self.txt_terminal.setReadOnly(True)
         self.txt_terminal.setStyleSheet(
-            "background-color: #E8EAF6; color: #3949AB; font-size: 13px; font-weight: bold; border: 2px solid #5C6BC0; padding: 8px; border-radius: 4px;"
+            f"QTextEdit {{ background-color: #F3F5FF; color: {T.INK}; font-size: 12px; font-weight: bold;"
+            f" border: 2px solid {T.PRIMARY}; padding: 6px; }}"
         )
         terminal_layout.addWidget(self.txt_terminal)
 
         controls_hlayout.addWidget(control_container, stretch=2)
         controls_hlayout.addWidget(terminal_container, stretch=2)
-        left_layout.addLayout(controls_hlayout)
-
+        left_layout.addLayout(controls_hlayout, stretch=1)
         content_layout.addLayout(left_layout, stretch=3)
 
-        # === 3. 专家评审模式区 (右侧) ===
-        review_container = QFrame()
-        apply_hard_shadow(review_container)
-        review_layout = QVBoxLayout(review_container)
-        review_layout.setContentsMargins(0, 0, 0, 0)
+        # === 3. 右侧：事件卡片与专家评审 ===
+        review_container = Card(padding=(0, 0, 0, 0), offset=6)
+        review_layout = review_container.body
         review_layout.setSpacing(0)
 
-        lbl_review_title = QLabel(" 检测结果预览 / 专家评审流水线 ")
-        lbl_review_title.setStyleSheet(
-            "background-color: #5C6BC0; color: #FFFFFF; font-size: 15px; padding: 10px; border: none;"
-        )
+        lbl_review_title = QLabel("  事件流 / 专家评审流水线")
+        lbl_review_title.setStyleSheet(f"background-color: {T.PRIMARY}; color: {T.PAPER}; font-size: 15px; padding: 8px 4px;")
         review_layout.addWidget(lbl_review_title)
+
+        self.lbl_review_summary = QLabel("事件 0 · 待评审 0 · 准确率 --")
+        self.lbl_review_summary.setStyleSheet(
+            f"background: {T.PRIMARY_SOFT}; color: {T.INK}; font-size: 12px; padding: 6px 10px;"
+            f" border-bottom: 2px solid {T.PRIMARY_MID};"
+        )
+        review_layout.addWidget(self.lbl_review_summary)
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.snapshots_widget = QWidget()
-        self.snapshots_widget.setStyleSheet("background-color: transparent; border: none;")
+        self.snapshots_widget.setStyleSheet("background: transparent;")
         self.snapshots_layout = QVBoxLayout(self.snapshots_widget)
+        self.snapshots_layout.setContentsMargins(10, 10, 6, 10)
         self.snapshots_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.snapshots_layout.setSpacing(14)
+        self.snapshots_layout.setSpacing(10)
+        self.lbl_empty = QLabel("暂无事件\n\n违规与告警会自动生成卡片\n也可以点击下方「抓拍」手动记录")
+        self.lbl_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_empty.setStyleSheet(f"color: {T.DIM}; font-size: 13px; padding: 40px 0;")
+        self.snapshots_layout.addWidget(self.lbl_empty)
         self.scroll_area.setWidget(self.snapshots_widget)
-        review_layout.addWidget(self.scroll_area)
+        review_layout.addWidget(self.scroll_area, stretch=1)
 
-        # 抓拍与导出按钮
         snap_btn_layout = QHBoxLayout()
-        snap_btn_layout.setAlignment(Qt.AlignmentFlag.AlignBottom)
-
-        self.btn_manual_snap = QPushButton("抓拍")
+        snap_btn_layout.setContentsMargins(10, 8, 10, 6)
+        self.btn_manual_snap = QPushButton("📸 抓拍")
         self.btn_export_all = QPushButton("导出")
-
-        snap_qss = """
-            QPushButton {
-                background-color: #FFF9C4; color: #5C6BC0; font-size: 20px; padding: 14px; border: 3px solid #5C6BC0; font-weight: bold;
-                margin-top:0px; margin-left:0px; margin-bottom:4px; margin-right:4px;
-            }
-            QPushButton:pressed {
-                background-color: #FFF176; margin-top:4px; margin-left:4px; margin-bottom:0px; margin-right:0px;
-            }
-        """
-        export_qss = """
-            QPushButton {
-                background-color: #E1F5FE; color: #5C6BC0; font-size: 14px; padding: 8px; border: 2px solid #5C6BC0; font-weight: bold;
-                margin-top:0px; margin-left:0px; margin-bottom:4px; margin-right:4px;
-            }
-            QPushButton:pressed {
-                background-color: #B3E5FC; margin-top:4px; margin-left:4px; margin-bottom:0px; margin-right:0px;
-            }
-        """
-        self.btn_manual_snap.setStyleSheet(snap_qss)
-        self.btn_export_all.setStyleSheet(export_qss)
-
+        self.btn_manual_snap.setStyleSheet(f"""
+            QPushButton {{ background-color: #FFF9C4; color: {T.PRIMARY}; font-size: 19px; padding: 12px; border: 3px solid {T.PRIMARY}; }}
+            QPushButton:pressed {{ background-color: #FFF176; }}
+        """)
+        self.btn_export_all.setStyleSheet(f"""
+            QPushButton {{ background-color: {T.BG}; color: {T.PRIMARY}; font-size: 14px; padding: 8px; }}
+            QPushButton:pressed {{ background-color: {T.SKY}; }}
+        """)
         apply_hard_shadow(self.btn_manual_snap, 5, 5)
         apply_hard_shadow(self.btn_export_all, 3, 3)
-
         snap_btn_layout.addWidget(self.btn_manual_snap, stretch=4)
         snap_btn_layout.addWidget(self.btn_export_all, stretch=1, alignment=Qt.AlignmentFlag.AlignBottom)
-
         btn_container = QWidget()
         btn_container.setLayout(snap_btn_layout)
-        btn_container.setStyleSheet("background: transparent; border: none;")
         review_layout.addWidget(btn_container)
 
         self.btn_manual_snap.clicked.connect(self.manual_snapshot)
         self.btn_export_all.clicked.connect(self.export_all_images)
 
-        # 计分板
         score_panel = QWidget()
-        score_panel.setStyleSheet("background-color: #E1F5FE; border: none; border-top: 3px solid #5C6BC0;")
+        score_panel.setStyleSheet(f"background-color: {T.BG}; border-top: 3px solid {T.PRIMARY};")
         score_layout = QVBoxLayout(score_panel)
+        score_layout.setContentsMargins(8, 6, 8, 8)
         self.lbl_score = QLabel("TOTAL SCORE: 0.00 / 35")
-        self.lbl_score.setStyleSheet(
-            "font-size: 20px; font-weight: 900; background: transparent; border: none; color: #5C6BC0;"
-        )
+        self.lbl_score.setStyleSheet(f"font-size: 20px; font-weight: 900; color: {T.PRIMARY}; border: none;")
         self.lbl_score.setAlignment(Qt.AlignmentFlag.AlignCenter)
         score_layout.addWidget(self.lbl_score)
         review_layout.addWidget(score_panel)
 
         content_layout.addWidget(review_container, stretch=1)
-        main_layout.addLayout(content_layout)
+        main_layout.addLayout(content_layout, stretch=1)
 
         # === 信号事件绑定 ===
         self.btn_model_ppe.toggled.connect(self.update_system_config)
@@ -1017,107 +1087,189 @@ class MainWindow(QMainWindow):
         self.is_slider_dragging = False
 
         self.update_system_config()
+        self.telemetry_card.update_telemetry(self.current_temp, self.current_humi, is_simulated=True)
 
     # ==========================================================================
-    # 六、 遥测与状态机联动槽函数
+    # 七、 遥测与状态机联动
     # ==========================================================================
+    def _hw_status(self):
+        link = self.inference_thread.serial
+        alive = bool(link is not None and link.is_alive)
+        hw = link.get_sensor_data() if alive else {}
+        return alive, hw
+
+    def _refresh_telemetry(self, state, force=False):
+        now = time.time()
+        if not force and now - self._last_tele_refresh < 0.25:
+            return
+        self._last_tele_refresh = now
+        snap = telemetry.snapshot()
+        alive, hw = self._hw_status()
+        sm = self.state_machine
+        footer = None
+        if sm.latched:
+            footer = f"⛔ 断电锁定：{sm.latch_reason} · 需现场长按控制盒复位键恢复供电（软件无法上电）"
+        self.telemetry_card.update_telemetry(
+            temp=self.current_temp,
+            humi=self.current_humi,
+            is_alert=state != "NORMAL",
+            is_simulated=self.sensor_worker.is_simulated,
+            is_external=self.sensor_worker.is_external_controlled,
+            status_text=state,
+            obj_temp=snap.get("obj_temp"),
+            smoke=snap.get("smoke"),
+            link_online=alive,
+            relay_on=hw.get("relay_on") if alive else None,
+            latched=(hw.get("latched") if alive else False) or sm.latched,
+            footer=footer,
+            state=state,
+        )
+
     def on_sensor_data_updated(self, temp: float, humi: float):
         """温湿度传感器数据到达槽函数"""
         self.current_temp = temp
         self.current_humi = humi
-
-        # 驱动跨模态状态机评估
-        state, alert_dict = self.state_machine.evaluate(
+        state, _ = self.state_machine.evaluate(
             micro_detections=self.latest_chem_items,
             macro_unattended=self.latest_unattended,
             current_temp=self.current_temp,
             current_humi=self.current_humi,
         )
-
-        is_alert = (state != "NORMAL")
-        status_text = "CRITICAL" if state == "CRITICAL" else ("ALERT" if is_alert else "SAFE")
-        self.telemetry_card.update_telemetry(
-            temp=temp,
-            humi=humi,
-            is_alert=is_alert,
-            is_simulated=self.sensor_worker.is_simulated,
-            is_external=self.sensor_worker.is_external_controlled,
-            status_text=status_text,
-        )
+        self._refresh_telemetry(state)
 
     def on_sensor_mode_changed(self, is_simulated: bool, msg: str):
         """传感器模式切换提示"""
         self.append_terminal_log(f"[硬件采集] {msg}")
+        self._refresh_telemetry(self.state_machine.current_state, force=True)
 
     def on_safety_alert(self, alert_dict: dict):
-        """状态机多模态安全告警推送槽函数"""
-        level = alert_dict.get("level", "WARNING")
-        title = alert_dict.get("title", "告警")
-        message = alert_dict.get("message", "")
-        ts = alert_dict.get("timestamp", datetime.now().strftime("%H:%M:%S"))
-
-        log_entry = f"\n🚨 [{ts}] [{level}] {title}\n{message}\n"
-        self.append_terminal_log(log_entry)
-
-        # 若发生紧急高危事件，主状态栏高亮
-        if level == "CRITICAL":
-            self.lbl_stats.setText(f" 状态: 紧急断电闭环生效中 | {ts} ")
-            self.lbl_stats.setStyleSheet(
-                "font-size: 15px; background-color: #FFCDD2; color: #D32F2F; border: 3px solid #D32F2F; padding: 10px;"
-            )
+        """状态机告警：立即刷新横幅与遥测卡片（日志与卡片由事件中心统一生成）"""
+        self.refresh_banner(force=True)
+        self._refresh_telemetry(self.state_machine.current_state, force=True)
 
     def append_terminal_log(self, text: str):
-        """向终端窗口追加日志"""
-        self.txt_terminal.append(text)
-        cursor = self.txt_terminal.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
-        self.txt_terminal.setTextCursor(cursor)
+        """界面层消息（显示在终端顶部，不会被每帧的识别日志覆盖）"""
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self._ui_msgs.append(f"[{stamp}] {text}")
+        self._last_log_html = ""
+
+    def refresh_banner(self, force=False):
+        """紧急 / 警告横幅：CRITICAL 红色闪烁，WARNING 琥珀色常亮，NORMAL 隐藏"""
+        sm = self.state_machine
+        state = sm.current_state
+        if state == "NORMAL":
+            if self.alert_banner.isVisible():
+                self.alert_banner.hide()
+                self._banner_key = None
+            return
+        if state == "CRITICAL":
+            link = self.inference_thread.serial
+            po = getattr(link, "power_off_state", "idle")
+            po_text = {
+                "pending": "断电指令已下发，等待下位机确认",
+                "acked": "下位机已确认断电，继电器已断开",
+                "failed_no_link": "串口未连接 —— 请立即人工切断加热电源",
+                "failed_no_ack": "下位机未应答 —— 请立即人工切断加热电源",
+            }.get(po, "演示模式：软件已模拟断电锁定")
+            reason = sm.latch_reason or "高危事件"
+            text = f"⛔ 紧急处置｜{reason}｜{po_text}｜恢复供电需现场长按复位键"
+            self._banner_blink = not self._banner_blink
+            bg = T.DANGER if self._banner_blink else "#C62839"
+            fg, border = T.PAPER, "#8E1B2A"
+        else:
+            warns = [e["title"] for e in events.active_events() if e.get("level") == "WARNING"]
+            text = "⚠ 警告｜" + ("、".join(warns[:4]) if warns else "环境或行为异常，请关注")
+            bg, fg, border = T.WARN_SOFT, "#92400E", T.WARN
+        key = (text, bg)
+        if key == self._banner_key and not force:
+            return
+        self._banner_key = key
+        self.alert_banner.setText(text)
+        self.alert_banner.setStyleSheet(
+            f"QLabel {{ background: {bg}; color: {fg}; border: 3px solid {border};"
+            f" font-size: 15px; padding: 6px 12px; }}"
+        )
+        self.alert_banner.show()
 
     # ==========================================================================
-    # 七、 视觉处理与传统业务流程保持
+    # 八、 视觉处理与业务流程
     # ==========================================================================
     def update_stats(self):
         secs = self.start_time.secsTo(QDateTime.currentDateTime())
-        h = secs // 3600
-        m = (secs % 3600) // 60
-        s = secs % 60
-        if self.state_machine.current_state == "CRITICAL":
-            self.lbl_stats.setText(f" 运行: {h:02d}:{m:02d}:{s:02d} | ⚠ 紧急断电状态 ")
-        elif self.state_machine.current_state == "WARNING":
-            self.lbl_stats.setText(f" 运行: {h:02d}:{m:02d}:{s:02d} | ⚠ 环境异常告警 ")
-        else:
-            self.lbl_stats.setText(f" 运行: {h:02d}:{m:02d}:{s:02d} | 正常守护中 ")
-            self.lbl_stats.setStyleSheet(
-                "font-size: 15px; background-color: #FFFFFF; color: #5C6BC0; border: 3px solid #5C6BC0; padding: 10px;"
-            )
+        h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
+        state = self.state_machine.current_state
+        color, soft, badge, cn = STATE_STYLE.get(state, STATE_STYLE["NORMAL"])
+        if state == "CRITICAL" and self.state_machine.latched:
+            cn = "断电锁定中"
+        self.lbl_state_chip.set(f"● {badge}", T.PAPER, color)
+        self.lbl_stats.setText(f" 运行 {h:02d}:{m:02d}:{s:02d} | {cn} ")
+        self.status_card.set_colors(border=color if state != "NORMAL" else T.PRIMARY,
+                                    shadow=color if state != "NORMAL" else T.PRIMARY)
+        self._refresh_telemetry(state, force=True)
+
+    def _render_terminal(self, log_str: str):
+        """把识别日志渲染为带颜色的 HTML；内容未变化时不重绘"""
+        colors = {"[紧急]": T.DANGER, "[警告]": "#B45309", "[提醒]": T.PRIMARY,
+                  "[解除]": T.SAFE, "[信息]": T.DIM, "[系统]": T.DIM, "======": T.PRIMARY}
+        # 把"最近事件"挪到最前面：它比逐帧识别结果更重要，不应该需要滚动才能看到
+        head, sep, recent = log_str.partition("====== 最近事件 ======")
+        ordered = (sep + recent + "\n" + head) if sep else log_str
+        parts = []
+        for msg in self._ui_msgs:
+            parts.append(f"<span style='color:{T.DIM}'>{html.escape(msg)}</span>")
+        for line in ordered.strip().splitlines():
+            if not line.strip():
+                continue
+            color = T.INK
+            for tag, c in colors.items():
+                if tag in line:
+                    color = c
+                    break
+            parts.append(f"<span style='color:{color}'>{html.escape(line)}</span>")
+        doc = "".join(f"<p style='margin:0 0 3px 0; line-height:125%;'>{x}</p>" for x in parts)
+        if doc != self._last_log_html:
+            self._last_log_html = doc
+            self.txt_terminal.setHtml(doc)
+        fps_line = next((l for l in log_str.splitlines() if l.startswith("[系统]")), "")
+        if "FPS" in fps_line:
+            seg = fps_line.split("|")[0].replace("[系统]", "").strip()
+            self.lbl_fps.set(seg, T.PRIMARY, T.PRIMARY_SOFT, T.PRIMARY_MID)
 
     def update_display(self, pano_img, desk_img, alarms, violations, curr_f, tot_f, log_str):
         # 提取微观通道物品列表与无人值守状态供状态机消费
         self.latest_unattended = alarms.get("unattended", False)
         self.latest_chem_items = alarms.get("chem_items", [])
 
-        # 驱动一次联合决策
-        state, alert_dict = self.state_machine.evaluate(
+        state, _ = self.state_machine.evaluate(
             micro_detections=self.latest_chem_items,
             macro_unattended=self.latest_unattended,
             current_temp=self.current_temp,
             current_humi=self.current_humi,
         )
-
-        # 更新遥测卡片状态
-        is_alert = (state != "NORMAL")
-        status_text = "CRITICAL" if state == "CRITICAL" else ("ALERT" if is_alert else "SAFE")
-        self.telemetry_card.update_telemetry(
-            temp=self.current_temp,
-            humi=self.current_humi,
-            is_alert=is_alert,
-            is_simulated=self.sensor_worker.is_simulated,
-            is_external=self.sensor_worker.is_external_controlled,
-            status_text=status_text,
-        )
+        self._refresh_telemetry(state)
 
         if log_str:
-            self.txt_terminal.setText(log_str.strip())
+            self._render_terminal(log_str)
+
+        # 视频标题栏状态胶囊
+        present = alarms.get("person_present")
+        if not alarms.get("vision_ok", True):
+            self.chip_pano.set("视觉离线", T.PAPER, T.DANGER)
+        elif present is None:
+            self.chip_pano.set("画面无效", T.DIM, T.PAPER, T.PRIMARY_MID)
+        elif self.latest_unattended:
+            self.chip_pano.set("● 无人值守", T.PAPER, T.WARN)
+        elif alarms.get("ppe_violation") or alarms.get("eating_drinking") or alarms.get("sleeping"):
+            self.chip_pano.set("● 违规", T.PAPER, T.DANGER)
+        else:
+            self.chip_pano.set("● 人员在岗", T.SAFE, T.PAPER, T.SAFE)
+        n_items = len(self.latest_chem_items)
+        if alarms.get("falling_warning"):
+            self.chip_desk.set(f"● 器皿近边 · {n_items}件", T.PAPER, T.WARN)
+        elif n_items:
+            self.chip_desk.set(f"器皿 × {n_items}", T.SAFE, T.PAPER, T.SAFE)
+        else:
+            self.chip_desk.set("台面空闲", T.PRIMARY, T.PAPER, T.PRIMARY_MID)
 
         if tot_f > 0:
             if self.slider_progress.maximum() != tot_f:
@@ -1130,35 +1282,38 @@ class MainWindow(QMainWindow):
             self.slider_progress.setValue(0)
             self.slider_progress.setMaximum(0)
 
-        pix1 = self.convert_cv_qt(pano_img)
-        pix2 = self.convert_cv_qt(desk_img)
-
-        self.lbl_pano.setPixmap(pix1)
-        self.lbl_desk.setPixmap(pix2)
+        self.lbl_pano.setPixmap(self.convert_cv_qt(pano_img))
+        self.lbl_desk.setPixmap(self.convert_cv_qt(desk_img))
 
         self.latest_pano = pano_img
         self.latest_desk = desk_img
 
-    def manual_snapshot(self):
-        if not hasattr(self, 'latest_pano') or self.latest_pano is None:
-            return
-        if len(self.snapshots) >= 20:
-            return
+    # ------------------------------------------------------------------
+    # 事件卡片
+    # ------------------------------------------------------------------
+    def pull_event_feed(self):
+        """从事件中心拉取新事件，自动生成卡片"""
+        for seq, ev in events.drain_feed(self._feed_seq):
+            self._feed_seq = max(self._feed_seq, seq)
+            if ev.get("kind") in CARD_SKIP_KINDS or ev.get("level") == "INFO":
+                continue
+            pano, desk = ev.get("frames", (None, None))
+            if pano is None and desk is None:
+                pano, desk = self.latest_pano, self.latest_desk
+            if pano is None:
+                continue
+            self._append_item(ev, pano, desk)
 
-        pix1 = self.convert_cv_qt(self.latest_pano)
-        pix2 = (
-            self.convert_cv_qt(self.latest_desk)
-            if hasattr(self, 'latest_desk') and self.latest_desk is not None
-            else QPixmap()
-        )
-
-        timestamp = QDateTime.currentDateTime().toString("HH:mm:ss")
-        index = len(self.snapshots)
-
+    def _append_item(self, ev, pano, desk):
         item = {
-            "time": timestamp,
-            "pixmap_pano": pix1,
-            "pixmap_desk": pix2,
+            "time": ev.get("time_str", QDateTime.currentDateTime().toString("HH:mm:ss")),
+            "title": ev.get("title", "抓拍"),
+            "message": ev.get("message", ""),
+            "level": ev.get("level", "NOTICE"),
+            "kind": ev.get("kind", "manual"),
+            "uid": ev.get("uid"),
+            "pixmap_pano": self.convert_cv_qt(pano),
+            "pixmap_desk": self.convert_cv_qt(desk) if desk is not None else QPixmap(),
             "reviewed": False,
             "is_correct": False,
             "card": None,
@@ -1166,63 +1321,81 @@ class MainWindow(QMainWindow):
             "btn_wrong": None,
         }
         self.snapshots.append(item)
-        self.add_snapshot_card(index)
+        self.add_snapshot_card(len(self.snapshots) - 1)
+        self._update_review_summary()
+
+    def manual_snapshot(self):
+        """手动抓拍：作为一条事件记录（入库 + 截图），由事件流生成卡片"""
+        if self.latest_pano is None:
+            return
+        events.set_latest_frames(self.latest_pano, self.latest_desk)
+        events.log("人工抓拍", "值守人员 / 评委手动记录当前画面", level="NOTICE", kind="manual", snapshot=True)
+        self.pull_event_feed()
 
     def add_snapshot_card(self, index):
         item = self.snapshots[index]
-        card = QFrame()
-        card.setStyleSheet(
-            "background-color: #FFFFFF; border: 2px solid #5C6BC0; margin-right: 4px; margin-bottom: 4px;"
-        )
-        apply_hard_shadow(card, offset_x=4, offset_y=4)
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(10, 10, 10, 10)
+        color, soft, tag = LEVEL_STYLE.get(item["level"], LEVEL_STYLE["NOTICE"])
+        if item["kind"] == "manual":
+            tag = "抓拍"
+        card = Card(padding=(10, 8, 8, 8), offset=4, accent=color)
+        card.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        card.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Maximum)
+        lay = card.body
+        lay.setSpacing(6)
 
-        lbl_title = QLabel(f"抓拍时间: {item['time']}")
-        lbl_title.setStyleSheet("border: none; background: transparent; font-size: 14px; color: #5C6BC0;")
-        card_layout.addWidget(lbl_title)
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        chip = Chip(tag, T.PAPER, color, size=11)
+        lbl_title = QLabel(item["title"])
+        lbl_title.setStyleSheet(f"font-size: 13px; color: {T.INK};")
+        lbl_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        lbl_title.setToolTip(item["title"])
+        lbl_time = QLabel(item["time"])
+        lbl_time.setStyleSheet(f"font-size: 11px; color: {T.DIM};")
+        top.addWidget(chip)
+        top.addWidget(lbl_title, stretch=1)
+        top.addWidget(lbl_time)
+        lay.addLayout(top)
+
+        if item["message"]:
+            lbl_msg = QLabel(item["message"])
+            lbl_msg.setWordWrap(True)
+            lbl_msg.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            lbl_msg.setMinimumHeight(30)
+            lbl_msg.setStyleSheet(f"font-size: 11px; color: {T.DIM};")
+            lay.addWidget(lbl_msg)
 
         images_layout = QHBoxLayout()
-        lbl_img1 = QLabel()
-        lbl_img1.setStyleSheet("border: 2px solid #5C6BC0; padding: 0;")
-        lbl_img1.setPixmap(item['pixmap_pano'].scaled(120, 90, Qt.AspectRatioMode.KeepAspectRatio))
-        images_layout.addWidget(lbl_img1)
-
-        if not item['pixmap_desk'].isNull():
-            lbl_img2 = QLabel()
-            lbl_img2.setStyleSheet("border: 2px solid #5C6BC0; padding: 0;")
-            lbl_img2.setPixmap(item['pixmap_desk'].scaled(120, 90, Qt.AspectRatioMode.KeepAspectRatio))
-            images_layout.addWidget(lbl_img2)
-
-        card_layout.addLayout(images_layout)
+        images_layout.setSpacing(6)
+        for pm in (item['pixmap_pano'], item['pixmap_desk']):
+            if pm.isNull():
+                continue
+            lbl_img = QLabel()
+            lbl_img.setFixedSize(108, 81)
+            lbl_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl_img.setStyleSheet(f"border: 2px solid {T.PRIMARY}; background: {T.SCREEN};")
+            lbl_img.setPixmap(pm.scaled(104, 77, Qt.AspectRatioMode.KeepAspectRatio,
+                                        Qt.TransformationMode.SmoothTransformation))
+            images_layout.addWidget(lbl_img)
+        images_layout.addStretch()
+        lay.addLayout(images_layout)
 
         btn_layout = QHBoxLayout()
-        btn_correct = QPushButton("正确")
-        btn_wrong = QPushButton("误报")
-
-        card_btn_style = """
-        QPushButton {
-            color: #5C6BC0; font-size: 12px; padding: 6px; border: 2px solid #5C6BC0; 
-            margin-top:0px; margin-left:0px; margin-bottom:3px; margin-right:3px;
-        }
-        QPushButton:pressed {
-            background-color: #4DD0E1; margin-top:3px; margin-left:3px; margin-bottom:0px; margin-right:0px;
-        }
-        QPushButton:disabled {
-            background-color: transparent; border: 2px dashed #9E9E9E; color: #9E9E9E;
-        }
-        """
-        btn_correct.setStyleSheet(card_btn_style)
-        btn_wrong.setStyleSheet(card_btn_style)
-        apply_hard_shadow(btn_correct, 2, 2)
-        apply_hard_shadow(btn_wrong, 2, 2)
-
+        btn_layout.setSpacing(6)
+        btn_correct = QPushButton("✔ 正确")
+        btn_wrong = QPushButton("✘ 误报")
+        btn_correct.setStyleSheet(f"QPushButton {{ color: {T.SAFE}; border-color: {T.SAFE}; font-size: 12px; padding: 5px; margin-bottom: 3px; margin-right: 3px; }}"
+                                  f" QPushButton:pressed {{ background: {T.SAFE}; color: {T.PAPER}; margin: 3px 0 0 3px; }}")
+        btn_wrong.setStyleSheet(f"QPushButton {{ color: {T.DANGER}; border-color: {T.DANGER}; font-size: 12px; padding: 5px; margin-bottom: 3px; margin-right: 3px; }}"
+                                f" QPushButton:pressed {{ background: {T.DANGER}; color: {T.PAPER}; margin: 3px 0 0 3px; }}")
+        for b in (btn_correct, btn_wrong):
+            b.setMinimumWidth(0)
+            b.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         btn_correct.clicked.connect(lambda: self.mark_item_reviewed(index, True))
         btn_wrong.clicked.connect(lambda: self.mark_item_reviewed(index, False))
-
         btn_layout.addWidget(btn_correct)
         btn_layout.addWidget(btn_wrong)
-        card_layout.addLayout(btn_layout)
+        lay.addLayout(btn_layout)
 
         item["card"] = card
         item["btn_correct"] = btn_correct
@@ -1233,7 +1406,25 @@ class MainWindow(QMainWindow):
             dialog.exec()
 
         card.mousePressEvent = on_click
+        self.lbl_empty.hide()
         self.snapshots_layout.insertWidget(0, card)
+
+        # 只保留最近 MAX_CARDS 张卡片，避免长时间运行占用内存与布局开销
+        live = [it for it in self.snapshots if it["card"] is not None]
+        if len(live) > self.MAX_CARDS:
+            old = live[0]
+            old["card"].setParent(None)
+            old["card"].deleteLater()
+            old["card"] = None
+
+    def _update_review_summary(self):
+        total = len(self.snapshots)
+        reviewed = [it for it in self.snapshots if it["reviewed"]]
+        correct = sum(1 for it in reviewed if it["is_correct"])
+        prec = f"{correct / len(reviewed) * 100:.0f}%" if reviewed else "--"
+        self.lbl_review_summary.setText(
+            f"事件 {total} · 待评审 {total - len(reviewed)} · 准确率 {prec}（{correct}/{len(reviewed)}）"
+        )
 
     def mark_item_reviewed(self, index, is_correct):
         item = self.snapshots[index]
@@ -1242,19 +1433,20 @@ class MainWindow(QMainWindow):
 
         item["reviewed"] = True
         item["is_correct"] = is_correct
+        events.set_review(item.get("uid"), is_correct)
 
         if is_correct:
             self.expert_score = min(35.0, self.expert_score + 1.75)
             self.lbl_score.setText(f"TOTAL SCORE: {self.expert_score:.2f} / 35")
-            color = "#C8E6C9"
+            bg = T.SAFE_SOFT
         else:
-            color = "#FFCDD2"
+            bg = T.DANGER_SOFT
 
-        item["btn_correct"].setEnabled(False)
-        item["btn_wrong"].setEnabled(False)
-        item["card"].setStyleSheet(
-            f"background-color: {color}; border: 2px solid #5C6BC0; margin-right: 4px; margin-bottom: 4px;"
-        )
+        if item["card"] is not None:
+            item["btn_correct"].setEnabled(False)
+            item["btn_wrong"].setEnabled(False)
+            item["card"].set_colors(bg=bg)
+        self._update_review_summary()
 
         if self.review_dialog and self.review_dialog.isVisible() and self.review_dialog.current_index == index:
             self.review_dialog.update_view()
@@ -1270,7 +1462,7 @@ class MainWindow(QMainWindow):
 
         count = 0
         for i, item in enumerate(self.snapshots):
-            file_name = f"snapshot_{i+1:02d}_{item['time'].replace(':','-')}.jpg"
+            file_name = f"snapshot_{i+1:02d}_{item['time'].replace(':','-')}_{item.get('kind', 'event')}.jpg"
             file_path = os.path.join(folder, file_name)
             self.save_combined_image(item, file_path)
             count += 1
@@ -1312,14 +1504,33 @@ class MainWindow(QMainWindow):
 
     def import_custom_model(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择自定义模型文件", "", "Model Files (*.pt *.onnx)"
+            self, "选择自定义模型文件（只加载自己训练的可信模型）", "",
+            "Model Files (*.pt *.onnx);;RKNN 模型目录中的任意文件 (*)"
         )
-        if file_path:
-            QMessageBox.information(self, "模型导入", f"成功选择并挂载模型:\n{file_path}")
+        if not file_path:
+            return
+        # 选中 RKNN 模型目录中的文件时，使用其所在目录
+        parent = os.path.dirname(file_path)
+        if parent.endswith("_rknn_model"):
+            file_path = parent
+        slot, ok = QInputDialog.getItem(self, "替换哪个模型？", "目标通道：",
+                                        ["人员模型（全景 Camera A）", "物品模型（台面 Camera B）"], 0, False)
+        if not ok:
+            return
+        QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
+        try:
+            success, msg = self.inference_thread.dual_system.reload_model(
+                "ppe" if slot.startswith("人员") else "chem", file_path)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if success:
+            QMessageBox.information(self, "模型已挂载", msg)
+        else:
+            QMessageBox.warning(self, "模型加载失败", msg)
 
     def import_media(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择视频或图片", "", "Media (*.mp4 *.avi *.jpg *.png *.jpeg)"
+            self, "选择视频或图片", "", "Media (*.mp4 *.avi *.mov *.mkv *.jpg *.png *.jpeg)"
         )
         if file_path:
             self.lbl_media_path.setText(f"当前媒体: {os.path.basename(file_path)}")
@@ -1333,7 +1544,7 @@ class MainWindow(QMainWindow):
             self.btn_play_pause.setText("⏸")
 
     def restore_cameras(self):
-        self.lbl_media_path.setText("当前媒体: 摄像头模式 (自动寻找已激活摄像头)")
+        self.lbl_media_path.setText("当前媒体: 摄像头模式（按 config.yaml 中的机位）")
         self.playback_widget.hide()
         self.inference_thread.dual_system.load_media(src1=0, src2=0, force_reload=True)
         self.btn_play_pause.setText("⏸")
@@ -1346,7 +1557,8 @@ class MainWindow(QMainWindow):
             "请输入手机摄像头串流地址或外接摄像头序号：\n\n"
             "• 局域网 App（如 IP Webcam）：http://192.168.x.x:8080/video\n"
             "• DroidCam 串流：http://192.168.x.x:4747/video\n"
-            "• USB/虚拟设备序号：输入数字 1 或 2\n",
+            "• USB/虚拟设备序号：输入数字 1 或 2\n"
+            "提示：请在手机 App 中开启访问密码，避免同网段他人查看画面",
             QLineEdit.EchoMode.Normal,
             "http://192.168.1.100:8080/video"
         )
@@ -1354,7 +1566,7 @@ class MainWindow(QMainWindow):
             target_src2 = url.strip()
             if target_src2.isdigit():
                 target_src2 = int(target_src2)
-            self.lbl_media_path.setText(f"当前媒体: 双摄协同 (主摄: 0, 副摄: {target_src2})")
+            self.lbl_media_path.setText(f"当前媒体: 双摄协同 (主摄: 默认, 副摄: {target_src2})")
             self.playback_widget.hide()
             self.inference_thread.dual_system.load_media(src1=0, src2=target_src2)
             self.btn_infer_phone.setChecked(True)
@@ -1365,31 +1577,25 @@ class MainWindow(QMainWindow):
     def toggle_play_pause(self):
         sys_obj = self.inference_thread.dual_system
         sys_obj.set_pause(not sys_obj.is_paused)
-        if sys_obj.is_paused:
-            self.btn_play_pause.setText("▶")
-        else:
-            self.btn_play_pause.setText("⏸")
+        self.btn_play_pause.setText("▶" if sys_obj.is_paused else "⏸")
 
     def slider_pressed(self):
         self.is_slider_dragging = True
 
     def slider_released(self):
         self.is_slider_dragging = False
-        target_frame = self.slider_progress.value()
-        self.inference_thread.dual_system.seek(target_frame)
+        self.inference_thread.dual_system.seek(self.slider_progress.value())
 
     def update_system_config(self):
-        conf = self.spin_conf.value()
-        iou = self.spin_iou.value()
-        img_size = self.spin_size.value()
-
-        enable_ppe = self.btn_model_ppe.isChecked()
-        enable_chem = self.btn_model_chem.isChecked()
-
-        self.inference_thread.dual_system.set_config("dual", enable_ppe, enable_chem, conf, iou, img_size)
+        self.inference_thread.dual_system.set_config(
+            "dual", self.btn_model_ppe.isChecked(), self.btn_model_chem.isChecked(),
+            self.spin_conf.value(), self.spin_iou.value(), self.spin_size.value())
 
     def closeEvent(self, event):
         """窗口关闭时优雅退出所有后台线程"""
+        for t in (getattr(self, "feed_timer", None), getattr(self, "banner_timer", None)):
+            if t is not None:
+                t.stop()
         if hasattr(self, 'sensor_worker') and self.sensor_worker:
             self.sensor_worker.stop()
         if hasattr(self, 'inference_thread') and self.inference_thread:

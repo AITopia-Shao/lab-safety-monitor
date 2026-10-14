@@ -89,3 +89,7 @@ notify:
 # ---- 演示模式 ----
 demo:
   allow_ipc_telemetry: true     # 允许 env_controller.py 注入模拟温湿度（只在未连接下位机时生效）；正式部署建议改为 false
+
+# ---- 界面 ----
+ui:
+  wave_fps:             # 海浪动画帧率；留空 = 自动（香橙派等 ARM 设备 10，PC 25）；0 = 静止（最省 CPU）

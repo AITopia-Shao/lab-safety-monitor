@@ -47,6 +47,7 @@ DEFAULTS = {
     },
     "notify": {"webhook_url": "", "min_level": "WARNING"},
     "demo": {"allow_ipc_telemetry": True},
+    "ui": {"wave_fps": None},
 }
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

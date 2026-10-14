@@ -12,6 +12,7 @@ src/core/events.py
 import os
 import json
 import time
+import uuid
 import queue
 import sqlite3
 import threading
@@ -45,6 +46,9 @@ class EventCenter:
         self._worker: Optional[threading.Thread] = None
         self._light_level = -1
         self.persist_enabled = True
+        # 界面事件流：事件开始 / 升级 / 一次性告警时推入，界面定时拉取生成事件卡片
+        self._feed = deque(maxlen=200)
+        self._feed_seq = 0
 
     # ------------------------------------------------------------------
     # 对外接口
@@ -67,8 +71,10 @@ class EventCenter:
                     "kind": kind, "level": level, "title": title, "message": message,
                     "details": details or {}, "since": now, "last_remind": now,
                     "time_str": datetime.fromtimestamp(now).strftime("%H:%M:%S"),
+                    "uid": uuid.uuid4().hex[:12],
                 }
                 self._active[kind] = ev
+                self._feed_push(ev, snapshot)
                 self._push_line(f"[{ev['time_str']}][{LEVEL_TAG.get(level, level)}] {title}：{message}")
                 self._enqueue_io("start", ev, snapshot)
                 self._act_on_start(ev)
@@ -78,7 +84,10 @@ class EventCenter:
                 # 等级升级（如 WARNING → CRITICAL）视为新的事件开始
                 if LEVEL_RANK.get(level, 0) > LEVEL_RANK.get(cur["level"], 0):
                     cur.update({"level": level, "title": title, "message": message,
-                                "details": details or {}, "last_remind": now})
+                                "details": details or {}, "last_remind": now,
+                                "uid": uuid.uuid4().hex[:12],
+                                "time_str": datetime.fromtimestamp(now).strftime("%H:%M:%S")})
+                    self._feed_push(cur, snapshot)
                     ts = datetime.fromtimestamp(now).strftime("%H:%M:%S")
                     self._push_line(f"[{ts}][{LEVEL_TAG.get(level, level)}] {title}（升级）：{message}")
                     self._enqueue_io("escalate", cur, snapshot)
@@ -106,8 +115,10 @@ class EventCenter:
         now = time.time()
         ev = {"kind": kind, "level": level, "title": title, "message": message,
               "details": details or {}, "since": now,
-              "time_str": datetime.fromtimestamp(now).strftime("%H:%M:%S")}
+              "time_str": datetime.fromtimestamp(now).strftime("%H:%M:%S"),
+              "uid": uuid.uuid4().hex[:12]}
         with self._lock:
+            self._feed_push(ev, snapshot)
             text = f"[{ev['time_str']}][{LEVEL_TAG.get(level, level)}] {title}"
             if message:
                 text += f"：{message}"
@@ -127,6 +138,22 @@ class EventCenter:
     def recent_lines(self, n: int = 8):
         with self._lock:
             return list(self._recent)[-n:]
+
+    def drain_feed(self, after_seq: int):
+        """返回序号大于 after_seq 的事件（含当时的标注画面），供界面生成事件卡片"""
+        with self._lock:
+            return [(seq, dict(ev)) for seq, ev in self._feed if seq > after_seq]
+
+    def set_review(self, uid: str, correct: bool):
+        """把人工评审结果（1=正确，0=误报）写回事件库"""
+        if uid:
+            self._enqueue_raw(("review", uid, 1 if correct else 0))
+
+    def _feed_push(self, ev: dict, snapshot: bool):
+        self._feed_seq += 1
+        item = dict(ev)
+        item["frames"] = self._latest_frames if snapshot else (None, None)
+        self._feed.append((self._feed_seq, item))
 
     # ------------------------------------------------------------------
     # 干预动作
@@ -192,9 +219,12 @@ class EventCenter:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ts REAL, time_str TEXT, phase TEXT, kind TEXT, level TEXT,
                     title TEXT, message TEXT, duration REAL, snapshot TEXT, details TEXT,
-                    review INTEGER DEFAULT NULL
+                    review INTEGER DEFAULT NULL, uid TEXT
                 )"""
             )
+            cols = {row[1] for row in db.execute("PRAGMA table_info(events)")}
+            if "uid" not in cols:
+                db.execute("ALTER TABLE events ADD COLUMN uid TEXT")
             db.commit()
         except Exception as e:
             print(f"[Event] 事件库初始化失败（仅影响留痕，不影响告警）: {e}")
@@ -203,7 +233,11 @@ class EventCenter:
         while True:
             item = self._io_q.get()
             try:
-                if item[0] == "webhook":
+                if item[0] == "review":
+                    if db is not None:
+                        db.execute("UPDATE events SET review=? WHERE uid=?", (item[2], item[1]))
+                        db.commit()
+                elif item[0] == "webhook":
                     _, url, content = item
                     body = json.dumps({"msgtype": "text", "text": {"content": content}}).encode("utf-8")
                     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
@@ -213,11 +247,12 @@ class EventCenter:
                     snap_path = self._save_snapshot(ev, frames)
                     if db is not None:
                         db.execute(
-                            "INSERT INTO events (ts, time_str, phase, kind, level, title, message, duration, snapshot, details)"
-                            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                            "INSERT INTO events (ts, time_str, phase, kind, level, title, message, duration, snapshot, details, uid)"
+                            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                             (time.time(), ev.get("time_str"), phase, ev.get("kind"), ev.get("level"),
                              ev.get("title"), ev.get("message"), ev.get("duration"), snap_path,
-                             json.dumps(ev.get("details", {}), ensure_ascii=False, default=str)),
+                             json.dumps(ev.get("details", {}), ensure_ascii=False, default=str),
+                             ev.get("uid") if phase != "end" else None),
                         )
                         db.commit()
             except Exception as e:

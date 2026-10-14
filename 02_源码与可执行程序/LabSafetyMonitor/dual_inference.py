@@ -336,6 +336,36 @@ class DualInferenceSystem:
         self.iou_thres = min(0.95, max(0.05, float(iou)))
         self.img_size = int(img_size) // 32 * 32 or 640
 
+    def reload_model(self, slot: str, path: str) -> Tuple[bool, str]:
+        """
+        运行时替换模型。slot: "ppe"（人员装备）或 "chem"（器皿）。
+        返回 (是否成功, 说明)。注意：.pt 文件本质是 pickle，只加载自己训练的可信模型。
+        """
+        if YOLO is None:
+            return False, f"ultralytics 不可用：{VISION_IMPORT_ERROR}"
+        if not os.path.exists(path):
+            return False, f"文件不存在：{path}"
+        try:
+            model = YOLO(path, task="detect")
+            names = model.names
+        except Exception as e:
+            return False, f"模型加载失败：{e}"
+        label = "人员装备模型" if slot == "ppe" else "器皿模型"
+        if slot == "ppe":
+            self.ppe_model, self.ppe_class_names = model, names
+        else:
+            self.chem_model, self.chem_class_names = model, names
+        self._fixed_imgsz = int(cfg("vision.imgsz", 640)) if path.rstrip("/\\").endswith("_rknn_model") else None
+        self.model_info[label] = path
+        self.vision_errors = [e for e in self.vision_errors if not e.startswith(label)]
+        self.vision_ok = not self.vision_errors
+        events.update("vision_offline", not self.vision_ok, "WARNING", "视觉模块离线", "；".join(self.vision_errors))
+        self._reset_temporal_state()
+        names_list = list(names.values()) if isinstance(names, dict) else list(names)
+        base = os.path.basename(path.rstrip("/\\"))  # f-string 表达式里不能写反斜杠（Python 3.10）
+        events.log("模型已切换", f"{label} ← {base}（{len(names_list)} 类）", kind="model")
+        return True, f"{label}已切换为：{path}\n类别（{len(names_list)}）：{', '.join(map(str, names_list[:20]))}"
+
     def stop(self):
         self.running = False
         if self.producer_thread:

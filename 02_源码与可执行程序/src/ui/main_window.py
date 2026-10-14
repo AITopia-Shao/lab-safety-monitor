@@ -94,12 +94,15 @@ class T:
     PRIMARY_MID = "#C5CAE9"
     CYAN = "#4DD0E1"        # 按下反馈
     SKY = "#B3E5FC"
-    DIM = "#7986CB"         # 次要文字
-    SAFE = "#00A86B"
+    DIM = "#5A64A8"         # 次要文字（各底色上对比度 ≥ 4.5）
+    SAFE = "#047857"        # 白字 5.5:1
     SAFE_SOFT = "#DDF7EC"
-    WARN = "#F59E0B"
+    WARN = "#F59E0B"        # 琥珀只做填充，上面配深色字 WARN_INK（白字只有 2.2:1）
+    WARN_INK = "#3B2300"    # 琥珀底上的文字 6.9:1
+    WARN_TEXT = "#92400E"   # 浅底上的警告文字 ≥ 5.9:1
     WARN_SOFT = "#FFF4D6"
-    DANGER = "#E53950"
+    DANGER = "#C62839"      # 白字 5.6:1
+    DANGER_DEEP = "#8E1B2A"
     DANGER_SOFT = "#FFE3E7"
     SCREEN = "#1A1F3D"      # 视频底色（深靛而非纯黑，更柔和）
 
@@ -110,6 +113,13 @@ STATE_STYLE = {
     "WARNING": (T.WARN, T.WARN_SOFT, "WARNING", "环境/行为异常"),
     "CRITICAL": (T.DANGER, T.DANGER_SOFT, "CRITICAL", "紧急处置中"),
 }
+# 状态必须"形状图标 + 文字"双重编码：红绿色弱用户无法仅凭颜色区分安全与紧急
+STATE_ICON = {"NORMAL": "✔", "WARNING": "▲", "CRITICAL": "⛔"}
+
+
+def ink_on(bg):
+    """填充色上应使用的文字颜色：琥珀底用深棕，其余用白"""
+    return T.WARN_INK if bg == T.WARN else T.PAPER
 # 事件等级 → (主色, 浅底色, 中文)
 LEVEL_STYLE = {
     "INFO": (T.DIM, T.PRIMARY_SOFT, "信息"),
@@ -374,13 +384,14 @@ class MetricTile(QWidget):
         if level == self._key:
             return
         self._key = level
-        border, bg, fg = {
-            "ok": (T.PRIMARY, T.PAPER, T.INK),
-            "idle": (T.PRIMARY_MID, T.PAPER, T.DIM),
-            "warn": (T.WARN, T.WARN_SOFT, "#B45309"),
-            "danger": (T.DANGER, T.DANGER_SOFT, T.DANGER),
+        # 数值文字始终用文字色（INK），状态由边框 / 底色 / 提示行里的图标承担
+        border, bg, fg, bw = {
+            "ok": (T.PRIMARY, T.PAPER, T.INK, 2),
+            "idle": (T.PRIMARY_MID, T.PAPER, T.DIM, 2),
+            "warn": (T.WARN, T.WARN_SOFT, T.INK, 3),
+            "danger": (T.DANGER, T.DANGER_SOFT, T.INK, 3),
         }[level]
-        self.setStyleSheet(f"QWidget#MetricTile {{ background: {bg}; border: 2px solid {border}; }}")
+        self.setStyleSheet(f"QWidget#MetricTile {{ background: {bg}; border: {bw}px solid {border}; }}")
         self.lbl_value.setStyleSheet(f"font-size: 22px; font-weight: 900; color: {fg};")
 
 
@@ -405,7 +416,7 @@ class TelemetryCard(Card):
         self.lbl_mode_badge = Chip("INIT", T.PAPER, T.DIM, size=11)
         self.lbl_link_badge = Chip("下位机 --", T.DIM, T.PAPER, T.PRIMARY_MID, size=11)
         self.lbl_relay_badge = Chip("继电器 --", T.DIM, T.PAPER, T.PRIMARY_MID, size=11)
-        self.lbl_status_badge = Chip("SAFE", T.PAPER, T.SAFE, size=13)
+        self.lbl_status_badge = Chip("✔ SAFE", T.PAPER, T.SAFE, size=13)
         header.addWidget(self.lbl_title)
         header.addStretch()
         header.addWidget(self.lbl_mode_badge)
@@ -456,18 +467,24 @@ class TelemetryCard(Card):
         dry = float(cfg("rules.dry_burn_c", 120.0))
         smoke_th = int(cfg("rules.smoke_raw", 1800))
 
-        self.tile_temp.set_value(f"{temp:.1f} ℃", "warn" if temp > amb_high else "ok", f"告警 > {amb_high:.0f}℃")
-        self.tile_humi.set_value(f"{humi:.1f} %", "warn" if humi > humi_high else "ok", f"告警 > {humi_high:.0f}%")
+        t_hot = temp > amb_high
+        h_hi = humi > humi_high
+        self.tile_temp.set_value(f"{temp:.1f} ℃", "warn" if t_hot else "ok",
+                                 f"{'▲ 偏高' if t_hot else '✔ 正常'} · 告警 > {amb_high:.0f}℃")
+        self.tile_humi.set_value(f"{humi:.1f} %", "warn" if h_hi else "ok",
+                                 f"{'▲ 过高' if h_hi else '✔ 正常'} · 告警 > {humi_high:.0f}%")
         if obj_temp is None:
             self.tile_obj.set_value("未接入", "idle", "MLX90614 红外测温")
         else:
             lvl = "danger" if obj_temp >= dry else ("warn" if obj_temp >= heat_on else "ok")
-            tag = "干烧！" if obj_temp >= dry else ("加热中" if obj_temp >= heat_on else "常温")
+            tag = "⛔ 干烧" if obj_temp >= dry else ("▲ 加热中" if obj_temp >= heat_on else "✔ 常温")
             self.tile_obj.set_value(f"{obj_temp:.1f} ℃", lvl, f"{tag} · 干烧 ≥ {dry:.0f}℃")
         if smoke is None:
             self.tile_smoke.set_value("未接入", "idle", "MQ-2 未接入或预热中")
         else:
-            self.tile_smoke.set_value(f"{smoke}", "danger" if smoke >= smoke_th else "ok", f"阈值 {smoke_th}")
+            hi = smoke >= smoke_th
+            self.tile_smoke.set_value(f"{smoke}", "danger" if hi else "ok",
+                                      f"{'⛔ 超标' if hi else '✔ 正常'} · 阈值 {smoke_th}")
 
         # 数据来源
         if not is_simulated:
@@ -495,7 +512,7 @@ class TelemetryCard(Card):
         if state is None:
             state = "CRITICAL" if status_text == "CRITICAL" else ("WARNING" if is_alert else "NORMAL")
         color, soft, badge, _ = STATE_STYLE.get(state, STATE_STYLE["NORMAL"])
-        self.lbl_status_badge.set(badge, T.PAPER, color)
+        self.lbl_status_badge.set(f"{STATE_ICON.get(state, '')} {badge}", ink_on(color), color)
         self.set_colors(border=color if state != "NORMAL" else T.PRIMARY,
                         shadow=color if state != "NORMAL" else T.PRIMARY)
 
@@ -683,7 +700,7 @@ class ReviewDialog(QDialog):
         color, _, tag = LEVEL_STYLE.get(item.get("level", "NOTICE"), LEVEL_STYLE["NOTICE"])
         if item.get("kind") == "manual":
             tag = "抓拍"
-        self.lbl_level.set(tag, T.PAPER, color)
+        self.lbl_level.set(tag, ink_on(color), color)
         self.lbl_title.setText(f"{item.get('title', '抓拍')}  ·  {item['time']}")
         self.lbl_index.setText(f"{self.current_index + 1} / {len(self.parent_gui.snapshots)}")
         self.lbl_message.setText(item.get("message", ""))
@@ -851,7 +868,7 @@ class MainWindow(QMainWindow):
         status_card = Card(padding=(12, 6, 12, 6), offset=5)
         status_row = QHBoxLayout()
         status_row.setSpacing(10)
-        self.lbl_state_chip = Chip("● SAFE", T.PAPER, T.SAFE, size=15)
+        self.lbl_state_chip = Chip("✔ SAFE", T.PAPER, T.SAFE, size=15)
         self.lbl_stats = QLabel(" 运行 00:00:00 | 正常守护中 ")
         self.lbl_stats.setStyleSheet(f"font-size: 15px; color: {T.INK};")
         status_row.addWidget(self.lbl_state_chip)
@@ -1174,12 +1191,13 @@ class MainWindow(QMainWindow):
             reason = sm.latch_reason or "高危事件"
             text = f"⛔ 紧急处置｜{reason}｜{po_text}｜恢复供电需现场长按复位键"
             self._banner_blink = not self._banner_blink
-            bg = T.DANGER if self._banner_blink else "#C62839"
-            fg, border = T.PAPER, "#8E1B2A"
+            # 闪烁的两个相位都保证白字对比度 ≥ 4.5（5.6 / 8.7）
+            bg = T.DANGER if self._banner_blink else T.DANGER_DEEP
+            fg, border = T.PAPER, T.DANGER_DEEP
         else:
             warns = [e["title"] for e in events.active_events() if e.get("level") == "WARNING"]
             text = "⚠ 警告｜" + ("、".join(warns[:4]) if warns else "环境或行为异常，请关注")
-            bg, fg, border = T.WARN_SOFT, "#92400E", T.WARN
+            bg, fg, border = T.WARN_SOFT, T.WARN_TEXT, T.WARN
         key = (text, bg)
         if key == self._banner_key and not force:
             return
@@ -1201,7 +1219,7 @@ class MainWindow(QMainWindow):
         color, soft, badge, cn = STATE_STYLE.get(state, STATE_STYLE["NORMAL"])
         if state == "CRITICAL" and self.state_machine.latched:
             cn = "断电锁定中"
-        self.lbl_state_chip.set(f"● {badge}", T.PAPER, color)
+        self.lbl_state_chip.set(f"{STATE_ICON.get(state, '')} {badge}", ink_on(color), color)
         self.lbl_stats.setText(f" 运行 {h:02d}:{m:02d}:{s:02d} | {cn} ")
         self.status_card.set_colors(border=color if state != "NORMAL" else T.PRIMARY,
                                     shadow=color if state != "NORMAL" else T.PRIMARY)
@@ -1209,7 +1227,7 @@ class MainWindow(QMainWindow):
 
     def _render_terminal(self, log_str: str):
         """把识别日志渲染为带颜色的 HTML；内容未变化时不重绘"""
-        colors = {"[紧急]": T.DANGER, "[警告]": "#B45309", "[提醒]": T.PRIMARY,
+        colors = {"[紧急]": T.DANGER, "[警告]": T.WARN_TEXT, "[提醒]": T.PRIMARY,
                   "[解除]": T.SAFE, "[信息]": T.DIM, "[系统]": T.DIM, "======": T.PRIMARY}
         # 把"最近事件"挪到最前面：它比逐帧识别结果更重要，不应该需要滚动才能看到
         head, sep, recent = log_str.partition("====== 最近事件 ======")
@@ -1258,14 +1276,14 @@ class MainWindow(QMainWindow):
         elif present is None:
             self.chip_pano.set("画面无效", T.DIM, T.PAPER, T.PRIMARY_MID)
         elif self.latest_unattended:
-            self.chip_pano.set("● 无人值守", T.PAPER, T.WARN)
+            self.chip_pano.set("▲ 无人值守", T.WARN_INK, T.WARN)
         elif alarms.get("ppe_violation") or alarms.get("eating_drinking") or alarms.get("sleeping"):
-            self.chip_pano.set("● 违规", T.PAPER, T.DANGER)
+            self.chip_pano.set("⛔ 违规", T.PAPER, T.DANGER)
         else:
-            self.chip_pano.set("● 人员在岗", T.SAFE, T.PAPER, T.SAFE)
+            self.chip_pano.set("✔ 人员在岗", T.SAFE, T.PAPER, T.SAFE)
         n_items = len(self.latest_chem_items)
         if alarms.get("falling_warning"):
-            self.chip_desk.set(f"● 器皿近边 · {n_items}件", T.PAPER, T.WARN)
+            self.chip_desk.set(f"▲ 器皿近边 · {n_items}件", T.WARN_INK, T.WARN)
         elif n_items:
             self.chip_desk.set(f"器皿 × {n_items}", T.SAFE, T.PAPER, T.SAFE)
         else:
@@ -1337,6 +1355,7 @@ class MainWindow(QMainWindow):
         color, soft, tag = LEVEL_STYLE.get(item["level"], LEVEL_STYLE["NOTICE"])
         if item["kind"] == "manual":
             tag = "抓拍"
+        tag = {"WARNING": "▲ ", "CRITICAL": "⛔ "}.get(item["level"], "") + tag
         card = Card(padding=(10, 8, 8, 8), offset=4, accent=color)
         card.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         card.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Maximum)
@@ -1345,9 +1364,10 @@ class MainWindow(QMainWindow):
 
         top = QHBoxLayout()
         top.setSpacing(6)
-        chip = Chip(tag, T.PAPER, color, size=11)
+        chip = Chip(tag, ink_on(color), color, size=11)
         lbl_title = QLabel(item["title"])
         lbl_title.setStyleSheet(f"font-size: 13px; color: {T.INK};")
+        lbl_title.setWordWrap(True)
         lbl_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         lbl_title.setToolTip(item["title"])
         lbl_time = QLabel(item["time"])

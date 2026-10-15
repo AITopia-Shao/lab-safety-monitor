@@ -93,7 +93,7 @@ notify:
 
 # ---- 演示模式 ----
 demo:
-  allow_ipc_telemetry: true     # 允许 env_controller.py 注入模拟温湿度（只在未连接下位机时生效）；正式部署建议改为 false
+  allow_ipc_telemetry: true     # 允许网页大屏「演示数据」注入模拟温湿度（只在未连接下位机时生效）；正式部署建议改为 false
 
 # ---- 界面 ----
 ui:

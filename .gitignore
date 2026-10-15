@@ -1,6 +1,7 @@
 # ---- 不上传：大文件与个人信息 ----
 *.mp4
 *报名表*.pdf
+local_private/       # 本地私有资料：演示视频、报名表等，不上传
 
 # ---- 运行时生成 ----
 runtime/
@@ -29,3 +30,6 @@ desktop.ini
 .vscode/
 .idea/
 ~$*
+
+# ---- 演示视频（体积大）----
+labguard/media/

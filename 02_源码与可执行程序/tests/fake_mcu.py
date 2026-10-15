@@ -8,7 +8,7 @@ import threading
 import time
 
 from serial_comm import (build_frame, FrameParser, CMD_HEARTBEAT, CMD_POWER_OFF, CMD_PLAY_VOICE,
-                         MSG_TELEMETRY, MSG_ACK, MSG_EVENT)
+                         CMD_SET_ENV, CMD_SET_ACT, MSG_TELEMETRY, MSG_ACK, MSG_EVENT, MSG_ENV_STATUS)
 
 
 class FakeMCU:
@@ -29,6 +29,9 @@ class FakeMCU:
         self.drop_acks = False
         self.last_hb = 0.0
         self._last_tel = 0.0
+        # 外部温湿度控制
+        self.env = {"mode": 0, "t_set": 26.0, "h_low": 40, "h_high": 70}
+        self.fan_pwm, self.humid_on, self.manual_until = 0, False, 0.0
 
     # ---- pyserial 接口 ----
     def read(self, n):
@@ -71,6 +74,14 @@ class FakeMCU:
             self._send(MSG_ACK, bytes([seq, cmd, 0]))
         elif cmd == CMD_PLAY_VOICE:
             self.voices.append(payload[0])
+        elif cmd == CMD_SET_ENV and len(payload) >= 5:
+            mode, t10, hl, hh = struct.unpack("<BhBB", payload[:5])
+            self.env = {"mode": mode, "t_set": t10 / 10.0, "h_low": hl, "h_high": hh}
+            if mode == 0:
+                self.manual_until = 0.0
+        elif cmd == CMD_SET_ACT and len(payload) >= 2:
+            self.fan_pwm, self.humid_on = payload[0], bool(payload[1])
+            self.manual_until = time.time() + 600
 
     def press_reset(self):
         hazard = self.obj_temp >= self.HARD_LIMIT_C
@@ -93,3 +104,10 @@ class FakeMCU:
             payload = struct.pack("<hHhHBB", int(self.temp * 10), int(self.humi * 10),
                                   int(self.obj_temp * 10), int(self.smoke), flags, self.cut_reason)
             self._send(MSG_TELEMETRY, payload)
+            if time.time() >= self.manual_until:
+                from src.core.env_control import control_law
+                self.fan_pwm, self.humid_on, _ = control_law(
+                    self.temp, self.humi, self.smoke, self.env["t_set"], self.env["h_low"],
+                    self.env["h_high"], 1200, self.fan_pwm, self.humid_on)
+            self._send(MSG_ENV_STATUS, bytes([self.fan_pwm, int(self.humid_on),
+                                              1 if time.time() < self.manual_until else 0]))

@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>实验室安全总后台</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<svg class="waves" aria-hidden="true" viewBox="0 0 1440 160" preserveAspectRatio="none">
+  <path d="M0 60 C 180 20, 360 100, 540 60 S 900 20, 1080 60 S 1350 100, 1440 50 L 1440 160 L 0 160 Z" fill="rgba(129,212,250,0.55)"/>
+  <path d="M0 90 C 160 120, 320 60, 520 92 S 860 130, 1060 88 S 1320 60, 1440 98 L 1440 160 L 0 160 Z" fill="rgba(92,107,192,0.32)"/>
+</svg>
+
+<div class="login hidden" id="login">
+  <div class="card">
+    <div class="sec-t">▌总后台登录</div>
+    <div class="muted">口令显示在实验台小屏的「设置」页，或板子上的 runtime/web_token.txt。</div>
+    <input type="password" id="tokenInput" placeholder="输入 6 位口令" aria-label="口令" autocomplete="off">
+    <button class="btn primary big" id="loginBtn">进入总后台</button>
+    <div class="muted" id="loginMsg"></div>
+  </div>
+</div>
+
+<div class="app">
+  <!-- 顶栏：标题 + 安全状态 -->
+  <div class="top">
+    <div class="card title-card">
+      <h1>基于双摄协同的实验室安全事前干预监测系统 · 总后台</h1>
+    </div>
+    <div class="card hero" id="hero">
+      <div class="badge" id="heroBadge">—</div>
+      <div class="body">
+        <div class="l1"><span id="heroState">连接中…</span><small id="heroUptime"></small></div>
+        <div class="l2" id="heroReason">等待安全引擎数据</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tabs" role="tablist">
+    <button class="btn on" data-tab="ov">总览</button>
+    <button class="btn" data-tab="params">参数</button>
+    <button class="btn" data-tab="agent">安全助手</button>
+    <button class="btn" data-tab="wm">温度预测</button>
+    <button class="btn" data-tab="env">环境控制</button>
+    <button class="btn" data-tab="review">事件复核</button>
+    <span class="spacer"></span>
+    <span class="muted" id="linkInfo">—</span>
+  </div>
+
+  <!-- ================= 总览 ================= -->
+  <section id="tab-ov" class="ov">
+    <div class="ov-left">
+      <div class="cams">
+        <div class="card"><div class="card-h"><span>Camera A · 全景（人员行为）</span><span class="chip" id="chipPano" style="background:#fff">等待画面</span></div>
+          <div class="screen"><div class="nosig">NO SIGNAL</div><img id="imgPano" alt="全景摄像头画面"><span class="live" id="fpsPano"></span></div></div>
+        <div class="card"><div class="card-h"><span>Camera B · 台面（器皿）</span><span class="chip" id="chipDesk" style="background:#fff">等待画面</span></div>
+          <div class="screen"><div class="nosig">NO SIGNAL</div><img id="imgDesk" alt="台面摄像头画面"><span class="live" id="mediaLabel"></span></div></div>
+      </div>
+      <div class="mid">
+        <div class="card heat" id="heatCard">
+          <div class="h1"><span>热源表面温度 · MLX90614</span><span id="heatThr">干烧阈值 —</span></div>
+          <div class="val"><b id="heatVal">--.-</b><span>℃</span><span class="chip" id="heatTag">未接入</span></div>
+          <svg id="heatSpark" viewBox="0 0 320 48" preserveAspectRatio="none" role="img" aria-label="热源温度最近一分钟曲线与预测"></svg>
+          <div id="heatEta" style="font-size:13px">—</div>
+        </div>
+        <div class="tiles">
+          <div class="tile" id="tTemp"><div><div class="lab">环境温度</div><div class="v">--</div></div><div class="hint"></div></div>
+          <div class="tile" id="tHumi"><div><div class="lab">相对湿度</div><div class="v">--</div></div><div class="hint"></div></div>
+          <div class="tile" id="tSmoke"><div><div class="lab">烟雾 MQ-2</div><div class="v">--</div></div><div class="hint"></div></div>
+        </div>
+        <div class="card pad chain">
+          <div class="sec-t">▌设备状态<small id="chainLink">—</small></div>
+          <div class="steps" id="chainSteps"></div>
+          <div class="muted">软件只能断电、不能上电 · 恢复供电需现场长按控制盒复位键</div>
+        </div>
+      </div>
+      <div class="bottom">
+        <div class="card pad">
+          <div class="sec-t">▌人员与操作<small id="presence">—</small></div>
+          <div class="actions">
+            <button class="btn big" style="background:var(--yellow)" id="btnSnap">抓拍当前画面</button>
+            <button class="btn big" id="btnMute">静音语音 60s</button>
+            <button class="btn big danger" id="btnCut" style="grid-column: 1 / 3">■ 一键断电（只能断电）</button>
+          </div>
+          <div class="ppe" id="ppeList"></div>
+        </div>
+        <div class="card pad">
+          <div class="sec-t">▌系统日志<small id="fpsInfo">—</small></div>
+          <div class="log" id="logBox"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card feed">
+      <div class="card-h"><span>事件记录</span></div>
+      <div class="stats">
+        <div><span>本次事件</span><b id="sTotal">0</b></div>
+        <div><span>待复核</span><b id="sPending">0</b></div>
+        <div><span>复核准确率</span><b id="sPrec">—</b></div>
+      </div>
+      <div class="filters" id="filters">
+        <button class="btn sm on" data-f="all">全部</button>
+        <button class="btn sm" data-f="pending">待复核</button>
+        <button class="btn sm" data-f="CRITICAL">紧急</button>
+        <button class="btn sm" data-f="WARNING">警告</button>
+      </div>
+      <div class="evlist" id="evList"></div>
+    </div>
+  </section>
+
+  <!-- ================= 参数 ================= -->
+  <section id="tab-params" class="page cols2 hidden">
+    <div class="card pad">
+      <div class="sec-t">▌安全规则与视觉阈值<small>修改即时生效，并保存到 runtime/config_override.yaml</small></div>
+      <div class="form-grid" id="cfgForm"></div>
+      <div class="row" style="margin-top:12px"><button class="btn ok" id="cfgSave">保存修改</button><span class="muted" id="cfgMsg"></span></div>
+      <div class="note-box" style="margin-top:10px">下位机本地硬规则（热源 150℃、烟雾 2500、30 秒失联看门狗）写在固件里，总后台不能修改 —— 这是最后一道防线。</div>
+    </div>
+    <div class="page">
+      <div class="card pad">
+        <div class="sec-t">▌识别模型<small>只能从 models/ 目录选择</small></div>
+        <div class="row" style="margin-bottom:8px"><button class="btn" id="tglPpe">人员装备模型</button><button class="btn" id="tglChem">台面器皿模型</button></div>
+        <div class="row"><select id="modelFile" class="grow" aria-label="模型文件"></select>
+          <select id="modelSlot" aria-label="替换通道"><option value="ppe">替换人员模型</option><option value="chem">替换器皿模型</option></select>
+          <button class="btn" id="modelApply">挂载</button></div>
+        <div class="muted" id="modelInfo" style="margin-top:8px"></div>
+      </div>
+      <div class="card pad">
+        <div class="sec-t">▌画面源</div>
+        <div class="row" style="margin-bottom:8px"><button class="btn" id="srcCam">恢复双摄直播</button><button class="btn" id="srcPause">暂停 / 继续</button></div>
+        <div class="row" style="margin-bottom:8px"><select id="mediaFile" class="grow" aria-label="演示视频"></select><button class="btn" id="srcVideo">播放视频</button></div>
+        <div class="row"><input type="text" id="urlPano" class="grow" placeholder="全景：序号或 http/rtsp 地址" aria-label="全景画面源">
+          <input type="text" id="urlDesk" class="grow" placeholder="台面：如 http://192.168.1.8:8080/video" aria-label="台面画面源">
+          <button class="btn" id="srcUrl">连接</button></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= Agent ================= -->
+  <section id="tab-agent" class="page cols2 hidden">
+    <div class="card pad">
+      <div class="sec-t">▌安全助手<small id="agentRouteNow">—</small></div>
+      <div class="chat" id="chat">
+        <div class="bubble">你好，我是实验室安全助手。可以问我：「现在安全吗？」「刚才为什么断电？」「干烧怎么处置？」<small>我只给建议，没有控制电源的能力。</small></div>
+      </div>
+      <div class="row" style="margin-top:10px"><input type="text" id="ask" class="grow" placeholder="输入问题，回车发送" aria-label="向 Agent 提问"><button class="btn primary" id="askBtn">发送</button><button class="btn" id="reportBtn">生成实验安全报告</button></div>
+    </div>
+    <div class="page">
+      <div class="card pad">
+        <div class="sec-t">▌模型线路<small>本地主机 / 远程 API / 规则兜底</small></div>
+        <div class="row" id="routeBtns" style="margin-bottom:10px">
+          <button class="btn" data-route="auto">自动（远程→本地→规则）</button><button class="btn" data-route="remote">远程 API</button>
+          <button class="btn" data-route="local">本地主机</button><button class="btn" data-route="off">仅规则</button></div>
+        <div class="form-grid">
+          <label class="f">远程地址<input type="text" id="rUrl"></label>
+          <label class="f">远程模型<input type="text" id="rModel"></label>
+          <label class="f">远程视觉模型<input type="text" id="rVModel"></label>
+          <label class="f">远程 API Key（仅存内存）<input type="password" id="rKey" placeholder="留空 = 用环境变量" autocomplete="off"></label>
+          <label class="f">本地地址（Ollama）<input type="text" id="lUrl"></label>
+          <label class="f">本地模型<input type="text" id="lModel"></label>
+          <label class="f">本地视觉模型<input type="text" id="lVModel" placeholder="如 qwen2.5vl:7b"></label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <label class="row muted"><input type="checkbox" id="autoReview"> 新告警自动给出处理建议</label>
+          <label class="row muted"><input type="checkbox" id="sendImg"> 允许把抓拍图发给远程 API</label>
+        </div>
+        <div class="row" style="margin-top:10px"><button class="btn ok" id="agentSave">保存线路设置</button>
+          <button class="btn" id="testRemote">测试远程</button><button class="btn" id="testLocal">测试本地</button></div>
+        <div class="muted" id="agentMsg" style="margin-top:8px"></div>
+      </div>
+      <div class="card pad">
+        <div class="sec-t">▌助手日志<small id="agentStat">—</small></div>
+        <div class="log" id="agentLog" style="height:140px"></div>
+        <div class="note-box" style="margin-top:8px">助手只能查看状态、事件、温度预测和安全手册，不能控制任何设备。断电只由规则和下位机执行。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 世界模型 ================= -->
+  <section id="tab-wm" class="page hidden">
+    <div class="card pad">
+      <div class="sec-t">▌热源温度预测<small>实线：实测 · 虚线：预测未来 120 秒 · 红线：干烧阈值</small></div>
+      <svg class="bigchart" id="wmChart" viewBox="0 0 900 300" preserveAspectRatio="none" role="img" aria-label="热源温度实测与预测曲线"></svg>
+      <div class="page cols3" style="margin-top:12px">
+        <div class="kv" id="wmKv"></div>
+        <div><div class="muted">干烧风险分</div><div class="bar" style="margin-top:6px"><i id="wmRisk" style="width:0"></i></div><div id="wmRiskTxt" class="muted" style="margin-top:4px">—</div></div>
+        <div class="note-box">升温段用一阶热平衡模型 dT/dt=(T∞−T)/τ 在线辨识，外推干烧倒计时；沸腾段温度停在 100℃ 附近，改用"平台持续时长"估计烧干风险。预测只用于提前提醒，不参与断电。</div>
+      </div>
+    </div>
+    <div class="card pad">
+      <div class="sec-t">▌画面异常检测（V-JEPA 2）<small id="jepaState">离线</small></div>
+      <div class="page cols2">
+        <svg class="bigchart" id="jepaChart" style="height:160px" viewBox="0 0 600 160" preserveAspectRatio="none" role="img" aria-label="V-JEPA 惊奇度曲线"></svg>
+        <div class="note-box">电脑端程序 hub/jepa_worker.py 每 10 秒取一段台面画面（16 帧）：只给 V-JEPA 2 看前 8 帧，让它预测后 8 帧的特征，再和真实画面比对。<b>预测误差越大，说明画面变化越出乎预期</b>（如液体突然飞溅、器皿倾倒）。程序先用正常画面建立基线，上报"偏离正常几倍标准差"（异常度），超过阈值记一条提醒事件。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 环境控制 ================= -->
+  <section id="tab-env" class="page cols2 hidden">
+    <div class="card pad">
+      <div class="sec-t">▌外部温湿度控制<small id="envSrc">—</small></div>
+      <div class="page cols2">
+        <div><div class="muted">排风扇</div><div class="bar" style="margin:6px 0"><i id="fanBar" style="width:0"></i></div><div id="fanTxt">—</div></div>
+        <div><div class="muted">加湿雾化片</div><div id="humTxt" style="font-size:22px;margin-top:4px">—</div></div>
+      </div>
+      <div class="note-box" id="envReason" style="margin:10px 0">—</div>
+      <div class="form-grid">
+        <label class="f">温度设定 ℃（15–35）<input type="number" id="eT" step="0.5"></label>
+        <label class="f">湿度下限 %（20–60）<input type="number" id="eHL"></label>
+        <label class="f">湿度上限 %（50–90）<input type="number" id="eHH"></label>
+      </div>
+      <div class="row" style="margin-top:10px"><button class="btn ok" id="envSave">保存设定值</button><span class="muted" id="envMsg"></span></div>
+      <div class="sec-t" style="margin-top:16px">▌手动控制<small>10 分钟后自动回到自动模式</small></div>
+      <div class="row"><span class="muted">风扇</span><input type="range" id="mFan" min="0" max="100" step="10" value="50" class="grow" aria-label="风扇转速"><span id="mFanV">50%</span>
+        <label class="row muted"><input type="checkbox" id="mHum"> 加湿</label>
+        <button class="btn" id="mApply">手动执行</button><button class="btn" id="mAuto">恢复自动</button></div>
+      <div class="note-box" style="margin-top:10px">控制律在 ESP32 下位机本地执行（断网、断主机也能工作）；烟雾超标时风扇强制满速、禁止加湿，并切断加热电源。</div>
+    </div>
+    <div class="card pad">
+      <div class="sec-t">▌演示场景注入<small id="demoState">—</small></div>
+      <div class="note-box" id="demoAvail" style="margin-bottom:10px"></div>
+      <div class="form-grid" id="demoBtns"></div>
+      <div class="sec-t" style="margin-top:16px">▌自定义数值</div>
+      <div class="form-grid">
+        <label class="f">环境温度 ℃<input type="number" id="cT" value="25"></label>
+        <label class="f">湿度 %<input type="number" id="cH" value="55"></label>
+        <label class="f">热源温度 ℃（空=未接入）<input type="number" id="cO"></label>
+        <label class="f">烟雾（空=未接入）<input type="number" id="cS"></label>
+      </div>
+      <div class="row" style="margin-top:10px"><button class="btn" id="demoCustom">注入自定义</button><button class="btn danger" id="demoStop">停止注入</button></div>
+      <div class="note-box" style="margin-top:10px">只在未接入下位机时可用；接上真实硬件后自动拒绝，真假数据不混用。注入的数据和真实传感器数据走同样的判断流程。</div>
+    </div>
+  </section>
+
+  <!-- ================= 复核 ================= -->
+  <section id="tab-review" class="page hidden">
+    <div class="card pad">
+      <div class="sec-t">▌事件复核<small>评委 / 管理员逐条确认，结果写回事件库</small></div>
+      <div class="row" style="margin-bottom:10px"><button class="btn" id="revRefresh">刷新</button><button class="btn" id="revExport">导出 CSV</button><span class="muted" id="revSum"></span></div>
+      <div style="overflow:auto"><table class="t" id="revTable"></table></div>
+    </div>
+  </section>
+</div>
+
+<div class="toast hidden" id="toast" role="status"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

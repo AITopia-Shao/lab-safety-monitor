@@ -10,3 +10,5 @@ ultralytics>=8.3.0          # 8.3 起支持 RKNN 模型导出与推理
 numpy>=1.24.0,<2.0.0        # numpy<2 没有 Python 3.13 安装包，请使用 3.10~3.12
 pyserial>=3.5
 PyYAML>=6.0
+fastapi>=0.110              # 网页大屏
+uvicorn>=0.29

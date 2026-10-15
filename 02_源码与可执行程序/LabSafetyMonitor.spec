@@ -15,6 +15,8 @@ datas = [
     ('LabSafetyMonitor/Zpix.ttf', 'LabSafetyMonitor'),
     ('LabSafetyMonitor/NerdFontSymbols.ttf', 'LabSafetyMonitor'),
     ('config.yaml', '.'),
+    ('knowledge', 'knowledge'),
+    ('src/web/static', 'src/web/static'),
 ] + ultralytics_datas
 
 hiddenimports = [
@@ -37,6 +39,18 @@ hiddenimports = [
     'src.core.events',
     'src.core.telemetry',
     'src.config',
+    'src.core.engine',
+    'src.core.world_model',
+    'src.core.env_control',
+    'src.core.demo',
+    'src.core.jepa_link',
+    'src.agent.agent',
+    'src.agent.llm_client',
+    'src.agent.rag',
+    'src.web.server',
+    'src.ui.kiosk',
+    'fastapi',
+    'uvicorn',
     'yaml',
     'sqlite3',
     'dual_inference',

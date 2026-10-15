@@ -17,6 +17,8 @@ src/core/state_machine.py
   R6 高湿          湿度 > humidity_high                                      → WARNING
   R7 环境高温      环境温度 > ambient_high_c                                 → WARNING
   R8 量器加热      正在加热 且 台面出现容量瓶/量筒等量器                     → NOTICE 提醒
+  R9 预测干烧      热力学世界模型预测 ETA ≤ predict_eta_warn_s 秒到达干烧阈值，
+                   或沸腾平台持续 ≥ boil_unattended_warn_s 秒且无人值守      → WARNING（只预警，不断电）
 
 断电锁定（LATCH）：
   一旦断电，状态保持 CRITICAL，直到现场按下控制盒的复位键（下位机上报）才解除。
@@ -35,6 +37,7 @@ except ImportError:
 from src.config import cfg
 from src.core.events import events
 from src.core.telemetry import telemetry
+from src.core.world_model import ThermalWorldModel
 
 LEVEL_RANK = {"NOTICE": 1, "WARNING": 2, "CRITICAL": 3}
 
@@ -74,7 +77,7 @@ class SafetyStateMachine(QObject):
 
     HAZARD_KINDS = (
         "dry_burn", "temp_rate", "unattended_heating", "dry_burn_fallback",
-        "smoke", "humidity_high", "ambient_high", "non_heatable_heating",
+        "smoke", "humidity_high", "ambient_high", "non_heatable_heating", "dry_burn_predict",
     )
 
     def __init__(self, serial_controller=None, parent=None):
@@ -97,6 +100,10 @@ class SafetyStateMachine(QObject):
         self._prev_hw_latched: Optional[bool] = None
         self._field_reset_flag = False
         self._listener_hooked = set()
+        # 器皿识别结果会逐帧跳动：最近 ITEM_HOLD_S 秒内出现过就算"在台面上"，避免规则反复触发 / 解除
+        self._item_seen: Dict[str, float] = {}
+        # 热力学世界模型：预测温度轨迹与干烧 ETA（只用于预警与展示，不参与断电）
+        self.world_model = ThermalWorldModel()
 
         self.set_serial_controller(serial_controller)
 
@@ -183,11 +190,19 @@ class SafetyStateMachine(QObject):
         if obj_temp is not None and snap.get("ts", 0) != self._last_tel_ts:
             self._last_tel_ts = snap.get("ts", 0)
             self._temp_hist.append((now, float(obj_temp)))
+            wm = self.world_model.update(float(obj_temp), now, bool(macro_unattended))
         elif obj_temp is None:
             self._temp_hist.clear()
+            wm = self.world_model.update(None, now)
+        else:
+            wm = self.world_model.snapshot()
 
-        heatable = self._match(micro_detections, self.heating_keywords)
-        non_heatable = self._match(micro_detections, self.NON_HEATABLE_VESSELS)
+        for item in micro_detections or []:
+            self._item_seen[str(item)] = now
+        hold = float(cfg("rules.item_hold_s", 3.0))
+        recent_items = [k for k, t in self._item_seen.items() if now - t <= hold]
+        heatable = self._match(recent_items, self.heating_keywords)
+        non_heatable = self._match(recent_items, self.NON_HEATABLE_VESSELS)
         heating = obj_temp is not None and obj_temp >= rules("heating_on_c", 50.0)
 
         hazards: Dict[str, Dict[str, Any]] = {}
@@ -209,6 +224,20 @@ class SafetyStateMachine(QObject):
                 and obj_temp >= rules("rate_min_c", 80.0) and "dry_burn" not in hazards):
             add("temp_rate", "WARNING", "热源升温异常",
                 f"热源 {obj_temp:.1f}℃，升温速率 {rate:.1f}℃/s，存在干烧趋势")
+
+        # R9 预测干烧（世界模型）：只预警，不断电
+        if obj_temp is not None and "dry_burn" not in hazards:
+            eta = wm.get("eta_s")
+            eta_warn = rules("predict_eta_warn_s", 90.0)
+            boil_warn = rules("boil_unattended_warn_s", 300.0)
+            if wm.get("phase") == "heating" and eta is not None and 0 < eta <= eta_warn:
+                trend = f"渐近温度 {wm['t_inf']:.0f}℃" if wm.get("t_inf") is not None else f"升温 {wm.get('slope') or 0:.2f}℃/s"
+                add("dry_burn_predict", "WARNING", "预测即将干烧",
+                    f"热源已越过沸点仍在升温（{obj_temp:.1f}℃，{trend}），液体可能已烧干，"
+                    f"预计约 {eta:.0f} 秒后达到 {dry_burn_c:.0f}℃，请立即关火或补液")
+            elif wm.get("phase") == "boiling" and macro_unattended and wm.get("plateau_s", 0) >= boil_warn:
+                add("dry_burn_predict", "WARNING", "沸腾中无人看守",
+                    f"已沸腾 {wm['plateau_s']:.0f} 秒且无人值守，液体持续蒸发，存在烧干风险")
 
         # R3 加热中无人值守
         cut_s = rules("unattended_heating_cut_s", 60.0)
@@ -310,7 +339,9 @@ class SafetyStateMachine(QObject):
                 continue
             started = events.update(kind, True, h["level"], h["title"], h["message"],
                                     details={"obj_temp": obj_temp, "temp": current_temp, "humi": current_humi,
-                                             "vessels": list(micro_detections or []), "unattended": macro_unattended})
+                                             "vessels": list(micro_detections or []), "unattended": macro_unattended,
+                                             "eta_s": wm.get("eta_s"), "phase": wm.get("phase"),
+                                             "risk": wm.get("risk")})
             if started and not h["cut"] and new_alert is None:
                 new_alert = self._make_alert(h["level"], h["event_type"], h["title"], h["message"],
                                              obj_temp, current_temp, current_humi)
@@ -381,6 +412,19 @@ class SafetyStateMachine(QObject):
                 return False, "未接入下位机（演示模式），已在软件中模拟断电锁定"
             return False, "串口未连接，断电指令无法下发！请立即人工切断加热电源（下位机本地保护仍独立生效）"
         return True, "断电指令已下发，等待下位机确认"
+
+    def manual_power_off(self, source: str = "人工") -> str:
+        """人工一键断电（小屏长按 / 总后台）。只能断电；恢复供电仍需现场按复位键"""
+        ok, action_msg = self._execute_power_off()
+        self.last_power_off_time = time.time()
+        if not self.latched:
+            self._set_latch(f"人工一键断电（{source}）")
+        events.log("人工一键断电", f"来源：{source}。{action_msg}", level="CRITICAL", kind="manual_power_off",
+                   snapshot=True)
+        if self.current_state != "CRITICAL":
+            self.current_state = "CRITICAL"
+            self.state_changed.emit("CRITICAL")
+        return action_msg
 
     def reset(self):
         """软件复位（仅清除软件状态；若下位机已锁定，仍需现场复位）"""

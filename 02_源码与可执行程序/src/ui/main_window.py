@@ -74,6 +74,7 @@ from src.core.events import events
 from src.core.telemetry import telemetry
 from src.hardware.sensor_worker import SensorWorker
 from src.core.state_machine import SafetyStateMachine
+from src.core.engine import SafetyEngine, InferenceThread  # InferenceThread 保留导出，兼容 main_gui.py
 from dual_inference import DualInferenceSystem
 from serial_comm import SerialComm
 
@@ -114,7 +115,7 @@ STATE_STYLE = {
     "CRITICAL": (T.DANGER, T.DANGER_SOFT, "CRITICAL", "紧急处置中"),
 }
 # 状态必须"形状图标 + 文字"双重编码：红绿色弱用户无法仅凭颜色区分安全与紧急
-STATE_ICON = {"NORMAL": "✔", "WARNING": "▲", "CRITICAL": "⛔"}
+STATE_ICON = {"NORMAL": "√", "WARNING": "▲", "CRITICAL": "■"}
 
 
 def ink_on(bg):
@@ -416,7 +417,7 @@ class TelemetryCard(Card):
         self.lbl_mode_badge = Chip("INIT", T.PAPER, T.DIM, size=11)
         self.lbl_link_badge = Chip("下位机 --", T.DIM, T.PAPER, T.PRIMARY_MID, size=11)
         self.lbl_relay_badge = Chip("继电器 --", T.DIM, T.PAPER, T.PRIMARY_MID, size=11)
-        self.lbl_status_badge = Chip("✔ SAFE", T.PAPER, T.SAFE, size=13)
+        self.lbl_status_badge = Chip("√ SAFE", T.PAPER, T.SAFE, size=13)
         header.addWidget(self.lbl_title)
         header.addStretch()
         header.addWidget(self.lbl_mode_badge)
@@ -470,21 +471,21 @@ class TelemetryCard(Card):
         t_hot = temp > amb_high
         h_hi = humi > humi_high
         self.tile_temp.set_value(f"{temp:.1f} ℃", "warn" if t_hot else "ok",
-                                 f"{'▲ 偏高' if t_hot else '✔ 正常'} · 告警 > {amb_high:.0f}℃")
+                                 f"{'▲ 偏高' if t_hot else '√ 正常'} · 告警 > {amb_high:.0f}℃")
         self.tile_humi.set_value(f"{humi:.1f} %", "warn" if h_hi else "ok",
-                                 f"{'▲ 过高' if h_hi else '✔ 正常'} · 告警 > {humi_high:.0f}%")
+                                 f"{'▲ 过高' if h_hi else '√ 正常'} · 告警 > {humi_high:.0f}%")
         if obj_temp is None:
             self.tile_obj.set_value("未接入", "idle", "MLX90614 红外测温")
         else:
             lvl = "danger" if obj_temp >= dry else ("warn" if obj_temp >= heat_on else "ok")
-            tag = "⛔ 干烧" if obj_temp >= dry else ("▲ 加热中" if obj_temp >= heat_on else "✔ 常温")
+            tag = "■ 干烧" if obj_temp >= dry else ("▲ 加热中" if obj_temp >= heat_on else "√ 常温")
             self.tile_obj.set_value(f"{obj_temp:.1f} ℃", lvl, f"{tag} · 干烧 ≥ {dry:.0f}℃")
         if smoke is None:
             self.tile_smoke.set_value("未接入", "idle", "MQ-2 未接入或预热中")
         else:
             hi = smoke >= smoke_th
             self.tile_smoke.set_value(f"{smoke}", "danger" if hi else "ok",
-                                      f"{'⛔ 超标' if hi else '✔ 正常'} · 阈值 {smoke_th}")
+                                      f"{'■ 超标' if hi else '√ 正常'} · 阈值 {smoke_th}")
 
         # 数据来源
         if not is_simulated:
@@ -500,7 +501,7 @@ class TelemetryCard(Card):
         elif link_online is False:
             self.lbl_link_badge.set("○ 下位机离线", T.DIM, T.PAPER, T.PRIMARY_MID)
         if latched:
-            self.lbl_relay_badge.set("⛔ 断电锁定", T.PAPER, T.DANGER)
+            self.lbl_relay_badge.set("■ 断电锁定", T.PAPER, T.DANGER)
         elif relay_on is True:
             self.lbl_relay_badge.set("继电器 闭合", T.INK, T.PAPER, T.PRIMARY)
         elif relay_on is False:
@@ -593,34 +594,6 @@ class WaveBackgroundWidget(QWidget):
 # ==============================================================================
 # 四、 推理与视频流线程
 # ==============================================================================
-class InferenceThread(QThread):
-    update_frames_signal = Signal(np.ndarray, np.ndarray, dict, list, int, int, str)
-
-    def __init__(self):
-        super().__init__()
-        self.running = True
-        self.dual_system = DualInferenceSystem(src1=0, src2=0)
-        self.serial = SerialComm(port='/dev/ttyUSB0')
-
-    def run(self):
-        self.dual_system.start()
-        self.serial.connect()
-        while self.running:
-            res = self.dual_system.get_results()
-            if res is not None:
-                frame_pano, frame_desk, alarms, violations, curr_f, tot_f, log_str = res
-                self.update_frames_signal.emit(
-                    frame_pano, frame_desk, alarms, violations, curr_f, tot_f, log_str
-                )
-            self.msleep(30)
-
-    def stop(self):
-        self.running = False
-        self.dual_system.stop()
-        self.serial.disconnect()
-        self.wait(1500)
-
-
 # ==============================================================================
 # 五、 专家评审模式弹窗 (ReviewDialog)
 # ==============================================================================
@@ -669,7 +642,7 @@ class ReviewDialog(QDialog):
         btn_layout = QHBoxLayout()
         self.btn_prev = QPushButton("◀ 上一张")
         self.btn_next = QPushButton("下一张 ▶")
-        self.btn_correct = QPushButton("✔ 正确 (计分)")
+        self.btn_correct = QPushButton("√ 正确 (计分)")
         self.btn_wrong = QPushButton("✘ 误报 (不计分)")
         self.btn_export = QPushButton("导出单张")
 
@@ -761,7 +734,7 @@ class MainWindow(QMainWindow):
 
     MAX_CARDS = 50
 
-    def __init__(self):
+    def __init__(self, engine: Optional[SafetyEngine] = None):
         super().__init__()
         self.setWindowTitle("实验室AI视觉守护系统 · 双摄协同 × 多源传感 × 边缘断电闭环")
         self.resize(1400, 940)
@@ -788,22 +761,16 @@ class MainWindow(QMainWindow):
         self._banner_blink = False
         self._banner_key = None
 
-        # 初始化后台线程与状态机
-        self.inference_thread = InferenceThread()
-        self.inference_thread.update_frames_signal.connect(self.update_display)
-
-        # 状态机：注入底层的串口控制实例
-        self.state_machine = SafetyStateMachine(
-            serial_controller=self.inference_thread.serial, parent=self
-        )
-        self.state_machine.alert_triggered.connect(self.on_safety_alert)
-
-        # 实例化环境遥测线程（串口统一由 SerialComm 管理）
-        self.sensor_worker = SensorWorker(
-            port="/dev/ttyUSB0", baudrate=9600, timeout=1.0, parent=self
-        )
-        self.sensor_worker.sensor_data_updated.connect(self.on_sensor_data_updated)
-        self.sensor_worker.mode_changed.connect(self.on_sensor_mode_changed)
+        # 安全核心引擎：推理、遥测、状态机研判都在引擎里，窗口只负责显示与操作
+        self._own_engine = engine is None
+        self.engine = engine or SafetyEngine(self)
+        self.inference_thread = self.engine.inference_thread
+        self.state_machine = self.engine.state_machine
+        self.sensor_worker = self.engine.sensor_worker
+        self.engine.frames_ready.connect(self.update_display)
+        self.engine.alert.connect(self.on_safety_alert)
+        self.engine.telemetry_changed.connect(self.on_engine_telemetry)
+        self.engine.sensor_mode_changed.connect(self.on_sensor_mode_changed)
 
         self.init_ui()
 
@@ -815,9 +782,9 @@ class MainWindow(QMainWindow):
         self.banner_timer.timeout.connect(self.refresh_banner)
         self.banner_timer.start(500)
 
-        # 启动线程
-        self.inference_thread.start()
-        self.sensor_worker.start()
+        # 启动引擎（由外部传入的引擎由调用方负责启动）
+        if self._own_engine:
+            self.engine.start()
 
     # ==========================================================================
     # 界面搭建
@@ -868,7 +835,7 @@ class MainWindow(QMainWindow):
         status_card = Card(padding=(12, 6, 12, 6), offset=5)
         status_row = QHBoxLayout()
         status_row.setSpacing(10)
-        self.lbl_state_chip = Chip("✔ SAFE", T.PAPER, T.SAFE, size=15)
+        self.lbl_state_chip = Chip("√ SAFE", T.PAPER, T.SAFE, size=15)
         self.lbl_stats = QLabel(" 运行 00:00:00 | 正常守护中 ")
         self.lbl_stats.setStyleSheet(f"font-size: 15px; color: {T.INK};")
         status_row.addWidget(self.lbl_state_chip)
@@ -1125,7 +1092,7 @@ class MainWindow(QMainWindow):
         sm = self.state_machine
         footer = None
         if sm.latched:
-            footer = f"⛔ 断电锁定：{sm.latch_reason} · 需现场长按控制盒复位键恢复供电（软件无法上电）"
+            footer = f"■ 断电锁定：{sm.latch_reason} · 需现场长按控制盒复位键恢复供电（软件无法上电）"
         self.telemetry_card.update_telemetry(
             temp=self.current_temp,
             humi=self.current_humi,
@@ -1142,17 +1109,17 @@ class MainWindow(QMainWindow):
             state=state,
         )
 
+    def on_engine_telemetry(self, state: str):
+        """引擎完成一次遥测研判后刷新面板（研判本身在引擎中完成）"""
+        self.current_temp = self.engine.current_temp
+        self.current_humi = self.engine.current_humi
+        self._refresh_telemetry(state)
+
     def on_sensor_data_updated(self, temp: float, humi: float):
-        """温湿度传感器数据到达槽函数"""
+        """兼容旧接口：只更新显示，不再在界面层研判"""
         self.current_temp = temp
         self.current_humi = humi
-        state, _ = self.state_machine.evaluate(
-            micro_detections=self.latest_chem_items,
-            macro_unattended=self.latest_unattended,
-            current_temp=self.current_temp,
-            current_humi=self.current_humi,
-        )
-        self._refresh_telemetry(state)
+        self._refresh_telemetry(self.state_machine.current_state)
 
     def on_sensor_mode_changed(self, is_simulated: bool, msg: str):
         """传感器模式切换提示"""
@@ -1189,7 +1156,7 @@ class MainWindow(QMainWindow):
                 "failed_no_ack": "下位机未应答 —— 请立即人工切断加热电源",
             }.get(po, "演示模式：软件已模拟断电锁定")
             reason = sm.latch_reason or "高危事件"
-            text = f"⛔ 紧急处置｜{reason}｜{po_text}｜恢复供电需现场长按复位键"
+            text = f"■ 紧急处置｜{reason}｜{po_text}｜恢复供电需现场长按复位键"
             self._banner_blink = not self._banner_blink
             # 闪烁的两个相位都保证白字对比度 ≥ 4.5（5.6 / 8.7）
             bg = T.DANGER if self._banner_blink else T.DANGER_DEEP
@@ -1253,17 +1220,11 @@ class MainWindow(QMainWindow):
             seg = fps_line.split("|")[0].replace("[系统]", "").strip()
             self.lbl_fps.set(seg, T.PRIMARY, T.PRIMARY_SOFT, T.PRIMARY_MID)
 
-    def update_display(self, pano_img, desk_img, alarms, violations, curr_f, tot_f, log_str):
-        # 提取微观通道物品列表与无人值守状态供状态机消费
+    def update_display(self, pano_img, desk_img, alarms, violations, curr_f, tot_f, log_str, state=None):
+        # 研判已在引擎中完成，这里只做显示
         self.latest_unattended = alarms.get("unattended", False)
         self.latest_chem_items = alarms.get("chem_items", [])
-
-        state, _ = self.state_machine.evaluate(
-            micro_detections=self.latest_chem_items,
-            macro_unattended=self.latest_unattended,
-            current_temp=self.current_temp,
-            current_humi=self.current_humi,
-        )
+        state = state or self.state_machine.current_state
         self._refresh_telemetry(state)
 
         if log_str:
@@ -1278,9 +1239,9 @@ class MainWindow(QMainWindow):
         elif self.latest_unattended:
             self.chip_pano.set("▲ 无人值守", T.WARN_INK, T.WARN)
         elif alarms.get("ppe_violation") or alarms.get("eating_drinking") or alarms.get("sleeping"):
-            self.chip_pano.set("⛔ 违规", T.PAPER, T.DANGER)
+            self.chip_pano.set("■ 违规", T.PAPER, T.DANGER)
         else:
-            self.chip_pano.set("✔ 人员在岗", T.SAFE, T.PAPER, T.SAFE)
+            self.chip_pano.set("√ 人员在岗", T.SAFE, T.PAPER, T.SAFE)
         n_items = len(self.latest_chem_items)
         if alarms.get("falling_warning"):
             self.chip_desk.set(f"▲ 器皿近边 · {n_items}件", T.WARN_INK, T.WARN)
@@ -1355,7 +1316,7 @@ class MainWindow(QMainWindow):
         color, soft, tag = LEVEL_STYLE.get(item["level"], LEVEL_STYLE["NOTICE"])
         if item["kind"] == "manual":
             tag = "抓拍"
-        tag = {"WARNING": "▲ ", "CRITICAL": "⛔ "}.get(item["level"], "") + tag
+        tag = {"WARNING": "▲ ", "CRITICAL": "■ "}.get(item["level"], "") + tag
         card = Card(padding=(10, 8, 8, 8), offset=4, accent=color)
         card.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         card.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Maximum)
@@ -1402,7 +1363,7 @@ class MainWindow(QMainWindow):
 
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(6)
-        btn_correct = QPushButton("✔ 正确")
+        btn_correct = QPushButton("√ 正确")
         btn_wrong = QPushButton("✘ 误报")
         btn_correct.setStyleSheet(f"QPushButton {{ color: {T.SAFE}; border-color: {T.SAFE}; font-size: 12px; padding: 5px; margin-bottom: 3px; margin-right: 3px; }}"
                                   f" QPushButton:pressed {{ background: {T.SAFE}; color: {T.PAPER}; margin: 3px 0 0 3px; }}")
@@ -1616,10 +1577,8 @@ class MainWindow(QMainWindow):
         for t in (getattr(self, "feed_timer", None), getattr(self, "banner_timer", None)):
             if t is not None:
                 t.stop()
-        if hasattr(self, 'sensor_worker') and self.sensor_worker:
-            self.sensor_worker.stop()
-        if hasattr(self, 'inference_thread') and self.inference_thread:
-            self.inference_thread.stop()
+        if getattr(self, "_own_engine", False):
+            self.engine.stop()
         event.accept()
 
 

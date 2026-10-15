@@ -61,10 +61,14 @@ rules:
   ambient_high_c: 40            # 环境温度过高告警 ℃
   fallback_ambient_cut_c: 55    # 未接入热源测温时的兜底规则：器皿 + 无人值守 + 环境温度超过该值 → 断电
   sim_latch_release_s: 10       # 无下位机（模拟模式）时，危险解除后多少秒自动解除断电锁定
+  predict_eta_warn_s: 90        # 越过沸点后仍在升温，预计这么多秒内达到干烧温度 → 提前提醒（不断电）
+  boil_unattended_warn_s: 300   # 沸腾持续这么多秒且无人值守 → 提醒（液体在持续蒸发）
+  item_hold_s: 3                # 器皿最近这么多秒内被识别到就算还在台面上（防止识别结果逐帧跳动导致反复告警）
 
 # ---- 事件、语音与存储 ----
 events:
   reminder_s: 30                # 违规持续存在时，每隔多少秒重复语音提醒一次
+  retrigger_s: 10               # 事件解除后这么多秒内再次出现，算同一次（识别结果时有时无时不反复刷屏）
   db: runtime/events.db
   snapshot_dir: runtime/snapshots
   voice:                        # DFPlayer 的 TF 卡曲目编号（0001.mp3 = 1）
@@ -80,6 +84,7 @@ events:
     dry_burn: 10
     smoke: 11
     humidity_high: 12
+    dry_burn_predict: 13
 
 # ---- 远程通知（L2 级别，可选）----
 notify:
@@ -93,3 +98,50 @@ demo:
 # ---- 界面 ----
 ui:
   wave_fps:             # 海浪动画帧率；留空 = 自动（香橙派等 ARM 设备 10，PC 25）；0 = 静止（最省 CPU）
+  kiosk_size:           # 小屏分辨率；留空 = 自动读取屏幕。PC 上调试小屏可写 [800, 480]
+
+# ---- 温度预测 ----
+world_model:
+  fit_window_s: 60      # 用最近多少秒的温度做拟合
+  boil_low_c: 92        # 沸腾平台的温度范围（水）
+  boil_high_c: 104
+  boil_full_risk_s: 600 # 沸腾持续这么久，风险分记满
+
+# ---- 网页大屏 ----
+web:
+  enabled: true
+  host: 0.0.0.0         # 0.0.0.0 = 局域网内其他电脑也能打开
+  port: 8080
+  token: ""             # 登录口令；留空 = 首次启动自动生成，保存在 runtime/web_token.txt，小屏「设置」页可查看
+  stream_fps: 6         # 网页画面帧率（越低越省 CPU）
+  stream_width: 640
+
+# ---- 安全助手（大模型） ----
+agent:
+  route: auto           # auto = 远程→本地→规则依次尝试；remote / local / off（只用规则模板）
+  auto_review: true     # 出现警告 / 紧急事件时自动生成处理建议
+  min_level: WARNING
+  timeout_s: 20
+  send_images_remote: false   # 是否把事件截图发给远程 API（默认不发，保护隐私）
+  remote:               # 远程 API：默认通义千问（OpenAI 兼容接口）
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: DASHSCOPE_API_KEY   # Key 放在这个环境变量里，不要写进本文件
+    model: qwen-plus
+    vision_model: qwen-vl-plus
+  local:                # 本地：电脑上的 Ollama（把 127.0.0.1 换成电脑的局域网 IP）
+    base_url: http://127.0.0.1:11434/v1
+    api_key_env: ""
+    model: qwen2.5:7b
+    vision_model: ""    # 如 qwen2.5vl:7b，留空 = 不看图
+
+# ---- 外部温湿度控制（排风扇 + 加湿片）----
+env:
+  t_set_c: 26           # 环境温度高于它 +1℃ 开始排风
+  h_low: 40             # 湿度低于它 -2% 开始加湿
+  h_high: 70            # 湿度高于它开始排风除湿
+  smoke_fan_raw: 1200   # 烟雾达到该值：排风满速、禁止加湿
+  manual_timeout_s: 600 # 手动控制多久后自动回到自动模式
+
+# ---- 画面异常检测（电脑端 V-JEPA 2，可选）----
+jepa:
+  surprise_threshold: 0 # 异常度（偏离正常画面的标准差倍数）超过它记一条提醒；0 = 只显示不记事件。建议先观察一段时间再填，如 4

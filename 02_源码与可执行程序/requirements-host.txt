@@ -1,0 +1,7 @@
+# 电脑端可选程序的依赖（不装在开发板上）
+#   hub/jepa_worker.py：V-JEPA 2 画面异常检测
+# 有 NVIDIA 显卡时，先按 https://pytorch.org 的说明安装带 CUDA 的 torch，再装下面这些
+torch>=2.3
+transformers>=4.53          # 4.53 起内置 V-JEPA 2
+numpy
+opencv-python-headless>=4.8.0

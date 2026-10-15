@@ -57,9 +57,12 @@ HEADER = b"\xAA\x55"
 CMD_HEARTBEAT = 0x01
 CMD_POWER_OFF = 0x02
 CMD_PLAY_VOICE = 0x03
+CMD_SET_ENV = 0x04      # [mode(0 自动/1 手动), t_set×10 (int16), h_low, h_high]
+CMD_SET_ACT = 0x05      # [fan_pwm 0-100, humid 0/1]，手动指令，下位机 10 分钟后自动回到自动模式
 MSG_TELEMETRY = 0x10
 MSG_ACK = 0x11
 MSG_EVENT = 0x12
+MSG_ENV_STATUS = 0x13   # [fan_pwm, humid, mode]
 
 INVALID_I16 = 0x7FFF
 INVALID_U16 = 0xFFFF
@@ -197,6 +200,7 @@ class SerialComm:
             "temp": None, "hum": None, "humi": None, "obj_temp": None, "smoke": None, "gas": None,
             "relay_on": False, "latched": False, "pc_link_ok": False, "sht_ok": False,
             "mlx_ok": False, "smoke_ready": False, "local_alarm": False, "cut_reason": 0, "ts": 0.0,
+            "fan_pwm": None, "humid_on": None, "env_mode": None,
         }
 
         with SerialComm._shared_lock:
@@ -346,6 +350,22 @@ class SerialComm:
         self._cmd_q.put((CMD_PLAY_VOICE, bytes([int(track) & 0xFF]), False))
         return True
 
+    def set_env(self, mode: int, t_set: float, h_low: float, h_high: float) -> bool:
+        """下发外部温湿度控制设定值（控制律在下位机本地执行）"""
+        if not self.is_open:
+            return False
+        payload = struct.pack("<BhBB", int(mode) & 0xFF, int(round(t_set * 10)),
+                              max(0, min(100, int(h_low))), max(0, min(100, int(h_high))))
+        self._cmd_q.put((CMD_SET_ENV, payload, False))
+        return True
+
+    def set_actuator(self, fan_pwm: int, humid: bool) -> bool:
+        """手动控制排风扇与加湿片（不涉及加热电源）"""
+        if not self.is_open:
+            return False
+        self._cmd_q.put((CMD_SET_ACT, bytes([max(0, min(100, int(fan_pwm))), 1 if humid else 0]), False))
+        return True
+
     def set_alert_level(self, level: int):
         level = max(0, min(2, int(level)))
         if level != self.alert_level:
@@ -451,6 +471,10 @@ class SerialComm:
                 else:
                     self.power_off_state = "failed_no_ack"
                     self._notify("power_off_failed", {"reason": f"下位机返回错误码 {result}"})
+        elif cmd == MSG_ENV_STATUS and len(payload) >= 3:
+            with self._data_lock:
+                self.sensor_data.update({"fan_pwm": int(payload[0]), "humid_on": bool(payload[1]),
+                                         "env_mode": int(payload[2])})
         elif cmd == MSG_EVENT and len(payload) >= 3:
             code, value = struct.unpack_from("<Bh", payload)
             self._notify("mcu_event", {"code": code, "value": value,

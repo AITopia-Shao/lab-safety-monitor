@@ -49,6 +49,15 @@ class EventCenter:
         # 界面事件流：事件开始 / 升级 / 一次性告警时推入，界面定时拉取生成事件卡片
         self._feed = deque(maxlen=200)
         self._feed_seq = 0
+        # 事件历史（供 Web 总后台 / 小屏 / Agent 查询）：uid -> 事件摘要（不含画面）
+        self._history = deque(maxlen=300)
+        self._by_uid: Dict[str, Dict[str, Any]] = {}
+        # 事件监听者 fn(rec)：事件开始 / 升级 / 一次性事件时调用；必须立即返回（只做入队）
+        self._listeners = []
+        # 刚解除的事件：kind -> (解除时间, 事件)。识别结果时有时无时，避免同一件事反复刷屏
+        self._ended: Dict[str, tuple] = {}
+        # 语音静音截止时间（小屏「静音」按钮）；只影响语音，不影响灯光、告警与断电
+        self.mute_until = 0.0
 
     # ------------------------------------------------------------------
     # 对外接口
@@ -66,6 +75,15 @@ class EventCenter:
         now = time.time()
         with self._lock:
             cur = self._active.get(kind)
+            if active and cur is None and kind in self._ended:
+                t_end, old = self._ended.pop(kind)
+                if now - t_end < float(cfg("events.retrigger_s", 10.0)) and                         LEVEL_RANK.get(level, 0) <= LEVEL_RANK.get(old["level"], 0):
+                    old["message"] = message
+                    self._active[kind] = old
+                    rec = self._by_uid.get(old.get("uid"))
+                    if rec is not None:
+                        rec["ended"] = False
+                    return None
             if active and cur is None:
                 ev = {
                     "kind": kind, "level": level, "title": title, "message": message,
@@ -102,7 +120,12 @@ class EventCenter:
                 return None
             if not active and cur is not None:
                 del self._active[kind]
+                self._ended[kind] = (now, cur)
                 dur = now - cur["since"]
+                rec = self._by_uid.get(cur.get("uid"))
+                if rec is not None:
+                    rec["ended"] = True
+                    rec["duration"] = round(dur, 1)
                 ts = datetime.fromtimestamp(now).strftime("%H:%M:%S")
                 self._push_line(f"[{ts}][解除] {cur['title']}（持续 {dur:.0f} 秒）")
                 self._enqueue_io("end", dict(cur, duration=dur), False)
@@ -147,13 +170,68 @@ class EventCenter:
     def set_review(self, uid: str, correct: bool):
         """把人工评审结果（1=正确，0=误报）写回事件库"""
         if uid:
+            with self._lock:
+                if uid in self._by_uid:
+                    self._by_uid[uid]["review"] = 1 if correct else 0
             self._enqueue_raw(("review", uid, 1 if correct else 0))
+
+    def set_agent_note(self, uid: str, text: str):
+        """Agent 研判结果写回事件（内存 + 事件库），小屏与总后台随即可见"""
+        if not uid:
+            return
+        with self._lock:
+            if uid in self._by_uid:
+                self._by_uid[uid]["agent_note"] = text
+        self._enqueue_raw(("agent_note", uid, text))
+
+    def add_listener(self, fn):
+        if fn not in self._listeners:
+            self._listeners.append(fn)
+
+    def history(self, n: int = 50, min_level: str = "INFO"):
+        """最近的事件（新的在前），不含画面"""
+        rank = LEVEL_RANK.get(min_level, 0)
+        with self._lock:
+            out = [dict(e) for e in reversed(self._history) if LEVEL_RANK.get(e["level"], 0) >= rank]
+        return out[:n]
+
+    def get_event(self, uid: str) -> Optional[dict]:
+        with self._lock:
+            e = self._by_uid.get(uid)
+            return dict(e) if e else None
+
+    def stats(self) -> Dict[str, int]:
+        """事件统计（不含 INFO）：总数、各等级数量、已复核数、复核为正确的数量"""
+        with self._lock:
+            out = {"total": 0, "CRITICAL": 0, "WARNING": 0, "NOTICE": 0, "reviewed": 0, "correct": 0}
+            for e in self._history:
+                if e["level"] == "INFO":
+                    continue
+                out["total"] += 1
+                out[e["level"]] = out.get(e["level"], 0) + 1
+                if e.get("review") is not None:
+                    out["reviewed"] += 1
+                    out["correct"] += int(e["review"])
+            return out
 
     def _feed_push(self, ev: dict, snapshot: bool):
         self._feed_seq += 1
         item = dict(ev)
         item["frames"] = self._latest_frames if snapshot else (None, None)
         self._feed.append((self._feed_seq, item))
+        rec = {k: ev.get(k) for k in ("uid", "kind", "level", "title", "message", "time_str", "since")}
+        rec["details"] = dict(ev.get("details") or {})
+        rec.update({"seq": self._feed_seq, "snapshot": None, "agent_note": None,
+                    "review": None, "ended": False})
+        if len(self._history) == self._history.maxlen:
+            self._by_uid.pop(self._history[0]["uid"], None)
+        self._history.append(rec)
+        self._by_uid[rec["uid"]] = rec
+        for fn in list(self._listeners):
+            try:
+                fn(dict(rec))
+            except Exception as e:
+                print(f"[Event] 监听者异常: {e}")
 
     # ------------------------------------------------------------------
     # 干预动作
@@ -163,6 +241,8 @@ class EventCenter:
         self._notify_webhook(ev)
 
     def _play_voice(self, kind: str):
+        if time.time() < self.mute_until:
+            return
         track = (cfg("events.voice", {}) or {}).get(kind)
         link = _serial()
         if track and link is not None:
@@ -225,6 +305,8 @@ class EventCenter:
             cols = {row[1] for row in db.execute("PRAGMA table_info(events)")}
             if "uid" not in cols:
                 db.execute("ALTER TABLE events ADD COLUMN uid TEXT")
+            if "agent_note" not in cols:
+                db.execute("ALTER TABLE events ADD COLUMN agent_note TEXT")
             db.commit()
         except Exception as e:
             print(f"[Event] 事件库初始化失败（仅影响留痕，不影响告警）: {e}")
@@ -237,6 +319,10 @@ class EventCenter:
                     if db is not None:
                         db.execute("UPDATE events SET review=? WHERE uid=?", (item[2], item[1]))
                         db.commit()
+                elif item[0] == "agent_note":
+                    if db is not None:
+                        db.execute("UPDATE events SET agent_note=? WHERE uid=?", (item[2], item[1]))
+                        db.commit()
                 elif item[0] == "webhook":
                     _, url, content = item
                     body = json.dumps({"msgtype": "text", "text": {"content": content}}).encode("utf-8")
@@ -245,6 +331,11 @@ class EventCenter:
                 elif item[0] == "event":
                     _, phase, ev, frames = item
                     snap_path = self._save_snapshot(ev, frames)
+                    if snap_path and ev.get("uid"):
+                        with self._lock:
+                            rec = self._by_uid.get(ev["uid"])
+                            if rec is not None and not rec.get("snapshot"):
+                                rec["snapshot"] = snap_path
                     if db is not None:
                         db.execute(
                             "INSERT INTO events (ts, time_str, phase, kind, level, title, message, duration, snapshot, details, uid)"

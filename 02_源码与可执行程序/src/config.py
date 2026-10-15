@@ -34,20 +34,39 @@ DEFAULTS = {
         "ambient_high_c": 40.0,
         "fallback_ambient_cut_c": 55.0,
         "sim_latch_release_s": 10.0,
+        "predict_eta_warn_s": 90.0,
+        "boil_unattended_warn_s": 300.0,
+        "item_hold_s": 3.0,
     },
     "events": {
         "reminder_s": 30.0,
+        "retrigger_s": 10.0,
         "db": "runtime/events.db",
         "snapshot_dir": "runtime/snapshots",
         "voice": {
             "ppe_goggles": 1, "ppe_coat": 2, "ppe_gloves": 3, "ppe_mask": 4, "ppe_headmask": 5,
             "eating": 6, "sleeping": 7, "edge_risk": 8, "unattended_heating": 9,
-            "dry_burn": 10, "smoke": 11, "humidity_high": 12,
+            "dry_burn": 10, "smoke": 11, "humidity_high": 12, "dry_burn_predict": 13,
         },
     },
     "notify": {"webhook_url": "", "min_level": "WARNING"},
     "demo": {"allow_ipc_telemetry": True},
-    "ui": {"wave_fps": None},
+    "ui": {"wave_fps": None, "kiosk_size": None},
+    "world_model": {"fit_window_s": 60.0, "boil_low_c": 92.0, "boil_high_c": 104.0, "boil_full_risk_s": 600.0},
+    "web": {"enabled": True, "host": "0.0.0.0", "port": 8080, "token": "", "stream_fps": 6, "stream_width": 640},
+    "agent": {
+        "route": "auto",
+        "auto_review": True,
+        "min_level": "WARNING",
+        "timeout_s": 20.0,
+        "send_images_remote": False,
+        "remote": {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                   "api_key_env": "DASHSCOPE_API_KEY", "model": "qwen-plus", "vision_model": "qwen-vl-plus"},
+        "local": {"base_url": "http://127.0.0.1:11434/v1", "api_key_env": "", "model": "qwen2.5:7b",
+                  "vision_model": ""},
+    },
+    "env": {"mode": "auto", "t_set_c": 26.0, "h_low": 40.0, "h_high": 70.0, "manual_timeout_s": 600.0},
+    "jepa": {"enabled": False, "surprise_threshold": 0.0},
 }
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -98,8 +117,55 @@ def load(force: bool = False) -> dict:
                 except Exception as e:
                     print(f"[config] 配置文件 {path} 读取失败，使用默认值: {e}")
                 break
+        # 运行时修改（Web 总后台调参）保存在 runtime/config_override.yaml，重启后仍生效
+        ov = _read_overrides()
+        if ov:
+            _deep_merge(merged, ov)
         _config = merged
         return _config
+
+
+def _override_path() -> str:
+    return resolve_path(os.path.join("runtime", "config_override.yaml"))
+
+
+def _read_overrides() -> dict:
+    path = _override_path()
+    if not os.path.isfile(path):
+        return {}
+    try:
+        import yaml
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f"[config] 运行时覆盖文件读取失败，已忽略: {e}")
+        return {}
+
+
+def set_value(path: str, value: Any, persist: bool = True):
+    """运行时修改一项配置（调用方负责校验取值范围），并写入覆盖文件"""
+    load()
+    keys = path.split(".")
+    with _lock:
+        node = _config
+        for k in keys[:-1]:
+            node = node.setdefault(k, {})
+        node[keys[-1]] = value
+    if not persist:
+        return
+    ov = _read_overrides()
+    node = ov
+    for k in keys[:-1]:
+        node = node.setdefault(k, {})
+    node[keys[-1]] = value
+    try:
+        import yaml
+        path_ = _override_path()
+        os.makedirs(os.path.dirname(path_), exist_ok=True)
+        with open(path_, "w", encoding="utf-8") as f:
+            yaml.safe_dump(ov, f, allow_unicode=True, sort_keys=False)
+    except Exception as e:
+        print(f"[config] 运行时覆盖文件写入失败（本次修改仅内存生效）: {e}")
 
 
 def cfg(path: str, default: Any = None) -> Any:

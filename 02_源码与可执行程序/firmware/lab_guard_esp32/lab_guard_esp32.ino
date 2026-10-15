@@ -8,6 +8,9 @@
  *   3. 本地硬规则（不依赖上位机）：热源超温、烟雾超标 → 立即断电
  *   4. 看门狗：上位机心跳丢失 30 秒且仍在加热 → 断电兜底
  *   5. 断电后锁定：只有现场长按复位键才能恢复供电（上位机只能断电，不能上电）
+ *   6. 外部温湿度控制：排风扇（PWM 调速）+ 加湿雾化片，控制律在本地执行，断网也能工作；
+ *      上位机只下发设定值（0x04）或 10 分钟有效的手动指令（0x05），状态用 0x13 上报。
+ *      控制律与 src/core/env_control.py 的 control_law() 完全一致。
  *
  * 依赖库（Arduino 库管理器搜索安装）：
  *   - Adafruit SHT31 Library（兼容 SHT30）
@@ -38,6 +41,8 @@ const int PIN_BUZZER = 14;   // 有源蜂鸣器（经三极管驱动）
 const int PIN_BTN    = 4;    // 复位 / 上电键，按下接地
 const int PIN_DF_RX  = 18;   // ESP32 RX ← DFPlayer TX
 const int PIN_DF_TX  = 17;   // ESP32 TX → 1kΩ → DFPlayer RX
+const int PIN_FAN    = 15;   // 排风扇：PWM → MOSFET 模块 → 5V 风扇
+const int PIN_HUMID  = 16;   // 加湿雾化片：MOSFET 模块开关
 
 const bool RELAY_ACTIVE_HIGH = true;   // 低电平触发的继电器模块改为 false
 
@@ -50,10 +55,13 @@ const uint32_t WATCHDOG_CUT_MS  = 30000;  // 失联超过该时间且仍在加�
 const float    WATCHDOG_HOT_C   = 60.0;
 const uint32_t SENSOR_PERIOD_MS = 500;
 const uint32_t BTN_LONG_MS      = 1000;
+const uint16_t SMOKE_FAN_RAW    = 1200;   // 烟雾达到该值：排风满速、禁止加湿
+const uint32_t MANUAL_MS        = 600000; // 手动指令有效期 10 分钟
 
 // ------------------------------- 协议 -------------------------------
 const uint8_t CMD_HEARTBEAT = 0x01, CMD_POWER_OFF = 0x02, CMD_PLAY_VOICE = 0x03;
-const uint8_t MSG_TELEMETRY = 0x10, MSG_ACK = 0x11, MSG_EVENT = 0x12;
+const uint8_t CMD_SET_ENV = 0x04, CMD_SET_ACT = 0x05;
+const uint8_t MSG_TELEMETRY = 0x10, MSG_ACK = 0x11, MSG_EVENT = 0x12, MSG_ENV_STATUS = 0x13;
 const int16_t  INVALID_I16 = 0x7FFF;
 const uint16_t INVALID_U16 = 0xFFFF;
 
@@ -75,6 +83,12 @@ uint8_t alertLevel = 0, prevAlertLevel = 0;
 uint32_t lastHb = 0, lastSensor = 0, btnDownAt = 0;
 bool btnHandled = false;
 uint8_t txSeq = 0;
+
+// 外部温湿度控制
+float envTSet = 26.0, envHLow = 40, envHHigh = 70;
+uint8_t fanPwm = 0;
+bool humidOn = false;
+uint32_t manualUntil = 0;
 
 uint8_t rxBuf[96];
 int rxLen = 0;
@@ -145,6 +159,14 @@ void handleFrame(uint8_t seq, uint8_t cmd, const uint8_t *p, uint8_t len) {
     sendFrame(MSG_ACK, ack, 3);
   } else if (cmd == CMD_PLAY_VOICE && len >= 1) {
     if (dfOk) df.playMp3Folder(p[0]);   // 播放 TF 卡 /mp3/000N.mp3（按文件名，不受拷贝顺序影响）
+  } else if (cmd == CMD_SET_ENV && len >= 5) {
+    int16_t t10; memcpy(&t10, p + 1, 2);
+    envTSet = t10 / 10.0; envHLow = p[3]; envHHigh = p[4];
+    if (p[0] == 0) manualUntil = 0;     // mode 0 = 回到自动
+  } else if (cmd == CMD_SET_ACT && len >= 2) {
+    fanPwm = p[0] > 100 ? 100 : p[0];
+    humidOn = p[1] != 0;
+    manualUntil = millis() + MANUAL_MS;
   }
 }
 
@@ -211,6 +233,32 @@ void sendTelemetry() {
   sendFrame(MSG_TELEMETRY, p, 10);
 }
 
+// ------------------------------- 外部温湿度控制 -------------------------------
+bool manualActive() { return manualUntil != 0 && (int32_t)(manualUntil - millis()) > 0; }
+
+void envControl() {
+  bool smoke = smokeReady() && smokeRaw >= SMOKE_FAN_RAW;
+  if (smoke) {                           // 烟雾优先：满速排风、禁止加湿（手动指令也不例外）
+    fanPwm = 100; humidOn = false;
+  } else if (!manualActive()) {
+    manualUntil = 0;
+    int fan = 0;
+    if (shtOk && !isnan(tempC) && tempC > envTSet + 1) fan = max(fan, (int)min(100.0f, 40 + 20 * (tempC - envTSet - 1)));
+    if (shtOk && !isnan(humi) && humi > envHHigh)      fan = max(fan, (int)min(100.0f, 40 + 6 * (humi - envHHigh)));
+    if (fan == 0 && fanPwm > 0 && ((shtOk && tempC > envTSet) || (shtOk && humi > envHHigh - 3))) fan = 30;  // 回差
+    fanPwm = fan;
+    if (shtOk && !isnan(humi)) {
+      if (humi < envHLow - 2) humidOn = true;
+      else if (humi > envHLow + 2) humidOn = false;
+      if (humi > envHHigh) humidOn = false;
+    }
+  }
+  analogWrite(PIN_FAN, (int)fanPwm * 255 / 100);
+  digitalWrite(PIN_HUMID, humidOn ? HIGH : LOW);
+  uint8_t st[3] = { fanPwm, (uint8_t)humidOn, (uint8_t)(manualActive() ? 1 : 0) };
+  sendFrame(MSG_ENV_STATUS, st, 3);
+}
+
 // ------------------------------- 按键与指示 -------------------------------
 void handleButton() {
   bool down = digitalRead(PIN_BTN) == LOW;
@@ -262,6 +310,8 @@ void setup() {
   pinMode(PIN_LED_R, OUTPUT); pinMode(PIN_LED_Y, OUTPUT); pinMode(PIN_LED_G, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_BTN, INPUT_PULLUP);
+  pinMode(PIN_FAN, OUTPUT);   analogWrite(PIN_FAN, 0);
+  pinMode(PIN_HUMID, OUTPUT); digitalWrite(PIN_HUMID, LOW);
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
 
@@ -285,6 +335,7 @@ void loop() {
     readSensors();
     evaluateLocalRules();
     sendTelemetry();
+    envControl();
   }
   handleButton();
   updateIndicators();

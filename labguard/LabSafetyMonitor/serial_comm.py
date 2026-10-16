@@ -300,6 +300,10 @@ class SerialComm:
             except Exception:
                 pass
         self.serial_conn = None
+        # 重连后必须重新收到遥测，不能把上一次连接的数据当作新下位机的状态。
+        with self._data_lock:
+            self.sensor_data.update({"ts": 0.0, "fan_pwm": None, "humid_on": None,
+                                     "env_mode": None})
         if self._pending:
             for item in self._pending.values():
                 if item["cmd"] == CMD_POWER_OFF:
@@ -461,7 +465,12 @@ class SerialComm:
             self._notify("telemetry", snap)
         elif cmd == MSG_ACK and len(payload) >= 3:
             ack_seq, ack_cmd, result = payload[0], payload[1], payload[2]
-            item = self._pending.pop(ack_seq, None)
+            item = self._pending.get(ack_seq)
+            # SEQ 会循环使用；其他指令的确认不能误报为已完成断电。
+            if item is not None and item["cmd"] == ack_cmd:
+                del self._pending[ack_seq]
+            else:
+                item = None
             self._notify("ack", {"seq": ack_seq, "cmd": ack_cmd, "result": result})
             if item is not None and item["cmd"] == CMD_POWER_OFF:
                 if result == 0:

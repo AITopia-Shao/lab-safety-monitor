@@ -22,6 +22,7 @@ for _p in (_root_dir, os.path.join(_root_dir, "LabSafetyMonitor")):
 
 import re
 import json
+import math
 import time
 import random
 import tempfile
@@ -120,6 +121,15 @@ class SensorWorker(QThread):
                 with open(self.IPC_TELEMETRY_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if "temp" in data and "humi" in data:
+                    # IPC 文件也可能由调试工具写入，拒绝坏值，避免采集线程退出。
+                    for key in ("temp", "humi", "obj_temp", "smoke"):
+                        value = data.get(key)
+                        if value is None and key in ("obj_temp", "smoke"):
+                            continue
+                        value = float(value)
+                        if not math.isfinite(value):
+                            return None
+                        data[key] = int(value) if key == "smoke" else value
                     return data
         except Exception:
             pass
@@ -151,7 +161,8 @@ class SensorWorker(QThread):
                 self._sleep(200)
                 continue
 
-            ext = self._read_ipc()
+            # 串口刚连接或暂时没有新遥测时，也不能转去读取演示文件。
+            ext = self._read_ipc() if not (link is not None and link.is_open) else None
             if ext is not None:
                 scenario = ext.get("scenario", "")
                 self._switch_mode(MODE_IPC, f"未接入下位机，使用环境模拟控制器数据（{scenario or '实时调控'}）")

@@ -1,0 +1,3 @@
+# 离线测试还需要 FastAPI TestClient 使用的 httpx。
+-r requirements.txt
+httpx>=0.27

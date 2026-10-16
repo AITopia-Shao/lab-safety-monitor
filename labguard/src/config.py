@@ -13,6 +13,7 @@ import os
 import sys
 import copy
 import threading
+import tempfile
 from typing import Any
 
 DEFAULTS = {
@@ -136,7 +137,10 @@ def _read_overrides() -> dict:
     try:
         import yaml
         with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            raise ValueError("配置内容必须是对象")
+        return data
     except Exception as e:
         print(f"[config] 运行时覆盖文件读取失败，已忽略: {e}")
         return {}
@@ -146,26 +150,39 @@ def set_value(path: str, value: Any, persist: bool = True):
     """运行时修改一项配置（调用方负责校验取值范围），并写入覆盖文件"""
     load()
     keys = path.split(".")
+    # 内存和覆盖文件用同一把锁，避免网页、Agent 等线程同时保存时丢失修改。
     with _lock:
         node = _config
         for k in keys[:-1]:
-            node = node.setdefault(k, {})
+            if not isinstance(node.get(k), dict):
+                node[k] = {}
+            node = node[k]
         node[keys[-1]] = value
-    if not persist:
-        return
-    ov = _read_overrides()
-    node = ov
-    for k in keys[:-1]:
-        node = node.setdefault(k, {})
-    node[keys[-1]] = value
-    try:
-        import yaml
-        path_ = _override_path()
-        os.makedirs(os.path.dirname(path_), exist_ok=True)
-        with open(path_, "w", encoding="utf-8") as f:
-            yaml.safe_dump(ov, f, allow_unicode=True, sort_keys=False)
-    except Exception as e:
-        print(f"[config] 运行时覆盖文件写入失败（本次修改仅内存生效）: {e}")
+        if not persist:
+            return
+        ov = _read_overrides()
+        node = ov
+        for k in keys[:-1]:
+            if not isinstance(node.get(k), dict):
+                node[k] = {}
+            node = node[k]
+        node[keys[-1]] = value
+        temp_path = None
+        try:
+            import yaml
+            path_ = _override_path()
+            os.makedirs(os.path.dirname(path_), exist_ok=True)
+            # 先完整写入同目录临时文件，再替换；写入失败时保留上一次的有效配置。
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path_),
+                                             prefix=".config_override_", suffix=".tmp", delete=False) as f:
+                temp_path = f.name
+                yaml.safe_dump(ov, f, allow_unicode=True, sort_keys=False)
+            os.replace(temp_path, path_)
+        except Exception as e:
+            print(f"[config] 运行时覆盖文件写入失败（本次修改仅内存生效）: {e}")
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
 
 def cfg(path: str, default: Any = None) -> Any:

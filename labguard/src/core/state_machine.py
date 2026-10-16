@@ -24,9 +24,11 @@ src/core/state_machine.py
   一旦断电，状态保持 CRITICAL，直到现场按下控制盒的复位键（下位机上报）才解除。
   软件只能断电、不能上电。未接入下位机的演示模式下，危险解除 sim_latch_release_s 秒后自动解除。
 """
+import threading
 import time
 from collections import deque
 from datetime import datetime
+from functools import wraps
 from typing import List, Dict, Any, Optional, Tuple
 
 try:
@@ -48,6 +50,14 @@ CUT_REASON_TEXT = {
     3: "上位机失联兜底（下位机看门狗）",
     4: "上位机联合决策",
 }
+
+
+def _synchronized(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return locked
 
 
 class SafetyStateMachine(QObject):
@@ -82,6 +92,8 @@ class SafetyStateMachine(QObject):
 
     def __init__(self, serial_controller=None, parent=None):
         super().__init__(parent)
+        # 网页人工断电和 Qt 评估可能并发，整次状态变更必须保持一致。
+        self._lock = threading.RLock()
         self.serial_controller = None
         self.heating_keywords = set(self.HEATABLE_VESSELS)
 
@@ -98,6 +110,8 @@ class SafetyStateMachine(QObject):
         self._temp_hist: deque = deque(maxlen=120)
         self._last_tel_ts = 0.0
         self._prev_hw_latched: Optional[bool] = None
+        # 连接中断不能把真实硬件锁定降为可自动解除的演示锁定。
+        self._hardware_observed = False
         self._field_reset_flag = False
         self._listener_hooked = set()
         # 器皿识别结果会逐帧跳动：最近 ITEM_HOLD_S 秒内出现过就算"在台面上"，避免规则反复触发 / 解除
@@ -110,6 +124,7 @@ class SafetyStateMachine(QObject):
     # ------------------------------------------------------------------
     # 下位机挂载
     # ------------------------------------------------------------------
+    @_synchronized
     def set_serial_controller(self, serial_controller):
         self.serial_controller = serial_controller
         if serial_controller is not None and hasattr(serial_controller, "add_listener"):
@@ -117,6 +132,7 @@ class SafetyStateMachine(QObject):
                 serial_controller.add_listener(self._on_serial_event)
                 self._listener_hooked.add(id(serial_controller))
 
+    @_synchronized
     def _on_serial_event(self, kind: str, info: dict):
         """串口线程回调：只记录日志、设置标志，界面相关动作留给 evaluate()（主线程）处理"""
         if kind == "power_off_acked":
@@ -172,6 +188,7 @@ class SafetyStateMachine(QObject):
     # ------------------------------------------------------------------
     # 主评估入口（接口保持不变）
     # ------------------------------------------------------------------
+    @_synchronized
     def evaluate(
         self,
         micro_detections: List[str],
@@ -185,6 +202,8 @@ class SafetyStateMachine(QObject):
         rules = lambda k, d: float(cfg(f"rules.{k}", d))
 
         snap = telemetry.snapshot()
+        if snap.get("source") == "hardware":
+            self._hardware_observed = True
         obj_temp = extra.get("obj_temp", snap.get("obj_temp"))
         smoke = extra.get("smoke", snap.get("smoke"))
         if obj_temp is not None and snap.get("ts", 0) != self._last_tel_ts:
@@ -256,7 +275,8 @@ class SafetyStateMachine(QObject):
 
         # R4 兜底规则：没有热源测温时，沿用"器皿 + 无人值守 + 环境高温"
         fallback_c = rules("fallback_ambient_cut_c", 55.0)
-        if obj_temp is None and heatable and macro_unattended and current_temp > fallback_c:
+        if (obj_temp is None and heatable and macro_unattended
+                and current_temp is not None and current_temp > fallback_c):
             add("dry_burn_fallback", "CRITICAL", "疑似干烧（环境温度兜底）",
                 f"台面有 {', '.join(heatable)}，无人值守，环境温度 {current_temp:.1f}℃ > {fallback_c:.0f}℃"
                 f"（未接入热源测温，使用兜底规则）",
@@ -289,6 +309,8 @@ class SafetyStateMachine(QObject):
         new_alert: Optional[Dict[str, Any]] = None
         cut_hazards = [h for h in hazards.values() if h["cut"]]
         hw = self._hw()
+        if hw is not None:
+            self._hardware_observed = True
 
         # 现场复位（下位机上报复位事件，或硬件锁定由 True 变为 False）
         hw_latched = hw.get("latched") if hw else None
@@ -324,8 +346,8 @@ class SafetyStateMachine(QObject):
                                                  micro_detections, macro_unattended, ok)
             self._hazard_clear_since = None
         elif self.latched:
-            # 无下位机时（演示模式），危险解除一段时间后自动解锁
-            if hw is None:
+            # 纯演示时可自动解锁；真实下位机失联后仍须等现场复位。
+            if hw is None and not self._hardware_observed:
                 if self._hazard_clear_since is None:
                     self._hazard_clear_since = now
                 elif now - self._hazard_clear_since >= rules("sim_latch_release_s", 10.0):
@@ -387,6 +409,8 @@ class SafetyStateMachine(QObject):
         }
 
     def _set_latch(self, reason: str):
+        if self._hw() is not None or telemetry.get("source") == "hardware":
+            self._hardware_observed = True
         self.latched = True
         self.latch_reason = reason
         self.latch_since = time.time()
@@ -401,18 +425,21 @@ class SafetyStateMachine(QObject):
     def _execute_power_off(self) -> Tuple[bool, str]:
         """向下位机下发断电指令；返回 (是否成功下发, 如实描述)"""
         link = self.serial_controller
+        demo_only = not self._hardware_observed and telemetry.get("source") != "hardware"
+        no_link_msg = "串口未连接，断电指令无法下发！请立即人工切断加热电源（下位机本地保护仍独立生效）"
         if link is None or not hasattr(link, "send_power_off"):
-            return False, "未挂载下位机，已在软件中锁定（演示模式）"
+            return False, "未挂载下位机，已在软件中锁定（演示模式）" if demo_only else no_link_msg
         try:
             ok = link.send_power_off()
         except Exception as e:
             return False, f"断电指令下发异常：{e}，请立即人工切断加热电源！"
         if ok is False:
-            if getattr(link, "is_open", False) is False and telemetry.get("source") != "hardware":
+            if getattr(link, "is_open", False) is False and demo_only:
                 return False, "未接入下位机（演示模式），已在软件中模拟断电锁定"
-            return False, "串口未连接，断电指令无法下发！请立即人工切断加热电源（下位机本地保护仍独立生效）"
+            return False, no_link_msg
         return True, "断电指令已下发，等待下位机确认"
 
+    @_synchronized
     def manual_power_off(self, source: str = "人工") -> str:
         """人工一键断电（小屏长按 / 总后台）。只能断电；恢复供电仍需现场按复位键"""
         ok, action_msg = self._execute_power_off()
@@ -426,6 +453,13 @@ class SafetyStateMachine(QObject):
             self.state_changed.emit("CRITICAL")
         return action_msg
 
+    @_synchronized
+    def snapshot(self) -> Dict[str, Any]:
+        """供其他线程读取同一次状态变更的锁定信息。"""
+        return {"state": self.current_state, "latched": self.latched,
+                "latch_reason": self.latch_reason}
+
+    @_synchronized
     def reset(self):
         """软件复位（仅清除软件状态；若下位机已锁定，仍需现场复位）"""
         self.latched = False

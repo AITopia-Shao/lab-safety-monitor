@@ -52,15 +52,26 @@ labguard/
 
 ## 快速开始（电脑）
 
-需要 Python 3.10–3.12。
+需要 Python 3.10–3.12。推荐用 conda 创建 Python 3.12 环境：
 
 ```bash
 cd labguard
-pip install -r requirements.txt
+conda env create -f environment.yml
+conda activate lab_safety
 python run_app.py
 ```
 
-启动后会打开电脑大窗口。用浏览器访问 `http://127.0.0.1:8080` 可以进入网页大屏，口令会打印在终端里，也保存在 `labguard/runtime/web_token.txt`。
+也可以使用虚拟环境（Windows 用 `py -3.11` 替代 `python3.11`，激活命令为 `.venv\Scripts\activate`）：
+
+```bash
+cd labguard
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python run_app.py
+```
+
+启动后会打开电脑大窗口。网页默认地址为 `http://127.0.0.1:8080`；端口被占用时自动顺延，实际地址见终端或 `labguard/runtime/web_url.txt`。口令会打印在终端里，也保存在 `labguard/runtime/web_token.txt`。启动脚本支持查找 conda 环境和项目内的 `.venv`。
 
 在电脑上查看实验台小屏界面：
 
@@ -71,8 +82,11 @@ python run_app.py --mode edge --windowed
 运行测试：
 
 ```bash
+python -m pip install -r requirements-dev.txt
 python tests/test_backend.py
 python tests/test_platform.py
+python -m unittest discover -s tests -p 'test_*_regressions.py' -v
+python tests/smoke_app.py  # 三种模式启动检查，使用测试图片和本机网络，无需真实硬件
 ```
 
 开发板部署见 `labguard/deploy/orangepi/setup.sh`。没有硬件时的演示方法见上手指南第 12 节。

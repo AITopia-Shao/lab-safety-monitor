@@ -14,6 +14,7 @@ src/web/server.py
 import asyncio
 import glob
 import json
+import math
 import os
 import secrets
 import socket
@@ -51,6 +52,16 @@ TUNABLE = {
 }
 
 
+def _number(value, integer: bool = False):
+    """JSON 数字可以用字符串传入，但不能把布尔值、小数或无穷值当作整数。"""
+    if isinstance(value, bool):
+        raise ValueError("需要数值")
+    number = float(value)
+    if not math.isfinite(number) or (integer and not number.is_integer()):
+        raise ValueError("需要有限数值" + ("整数" if integer else ""))
+    return int(number) if integer else number
+
+
 def web_token() -> str:
     tok = str(cfg("web.token", "") or "").strip()
     if tok:
@@ -79,7 +90,7 @@ def create_app(engine) -> FastAPI:
 
     def auth(request: Request):
         got = request.headers.get("x-token") or request.query_params.get("token") or ""
-        if not secrets.compare_digest(got, token):
+        if not secrets.compare_digest(got.encode("utf-8"), token.encode("utf-8")):
             raise HTTPException(401, "口令错误")
 
     ext = engine.extensions
@@ -178,7 +189,9 @@ def create_app(engine) -> FastAPI:
 
     @app.get("/api/frame/{which}.jpg", dependencies=[Depends(auth)])
     def frame(which: str):
-        data = engine.latest_jpeg(which if which in ("pano", "desk") else "pano")
+        if which not in ("pano", "desk"):
+            raise HTTPException(404, "没有这个机位")
+        data = engine.latest_jpeg(which)
         if not data:
             raise HTTPException(404, "暂无画面")
         return StreamingResponse(iter([data]), media_type="image/jpeg")
@@ -186,7 +199,7 @@ def create_app(engine) -> FastAPI:
     # ---------------- WebSocket 推送（2 Hz） ----------------
     @app.websocket("/ws")
     async def ws(sock: WebSocket):
-        if not secrets.compare_digest(sock.query_params.get("token", ""), token):
+        if not secrets.compare_digest(sock.query_params.get("token", "").encode("utf-8"), token.encode("utf-8")):
             await sock.close(code=4401)
             return
         await sock.accept()
@@ -211,8 +224,8 @@ def create_app(engine) -> FastAPI:
                 continue
             typ, lo, hi, _ = spec
             try:
-                v = typ(val)
-            except (TypeError, ValueError):
+                v = _number(val, integer=typ is int)
+            except (TypeError, ValueError, OverflowError):
                 errors[key] = "类型错误"
                 continue
             if not (lo <= v <= hi):
@@ -303,7 +316,13 @@ def create_app(engine) -> FastAPI:
     @app.post("/api/mute", dependencies=[Depends(auth)])
     async def mute(request: Request):
         data = await body(request)
-        until = engine.mute(float(data.get("seconds", 60)))
+        try:
+            seconds = _number(data.get("seconds", 60))
+            if seconds < 0:
+                raise ValueError("静音时长不能小于 0")
+        except (TypeError, ValueError, OverflowError):
+            raise HTTPException(422, "静音时长需要大于等于 0 的有限数值")
+        until = engine.mute(seconds)
         return {"mute_until": until}
 
     @app.post("/api/events/{uid}/review", dependencies=[Depends(auth)])
@@ -311,7 +330,9 @@ def create_app(engine) -> FastAPI:
         data = await body(request)
         if events.get_event(uid) is None:
             raise HTTPException(404, "事件不存在")
-        events.set_review(uid, bool(data.get("correct")))
+        if not isinstance(data.get("correct"), bool):
+            raise HTTPException(422, "correct 必须是 true 或 false")
+        events.set_review(uid, data["correct"])
         return {"ok": True}
 
     @app.post("/api/manual_snapshot", dependencies=[Depends(auth)])
@@ -330,7 +351,11 @@ def create_app(engine) -> FastAPI:
 
     @app.post("/api/agent/config", dependencies=[Depends(auth)])
     async def agent_config(request: Request):
-        return need("agent").configure(await body(request))
+        data = await body(request)
+        for name in ("remote", "local"):
+            if name in data and not isinstance(data[name], dict):
+                raise HTTPException(422, f"{name} 配置必须是对象")
+        return need("agent").configure(data)
 
     @app.post("/api/agent/test", dependencies=[Depends(auth)])
     async def agent_test(request: Request):
@@ -375,7 +400,17 @@ def create_app(engine) -> FastAPI:
     async def env_manual(request: Request):
         data = await body(request)
         fan = data.get("fan_pwm")
-        msg = need("env").set_manual(None if fan is None else int(fan), bool(data.get("humid")))
+        humid = data.get("humid", False)
+        if not isinstance(humid, bool):
+            raise HTTPException(422, "humid 必须是 true 或 false")
+        if fan is not None:
+            try:
+                fan = _number(fan, integer=True)
+                if not 0 <= fan <= 100:
+                    raise ValueError("风扇转速越界")
+            except (TypeError, ValueError, OverflowError):
+                raise HTTPException(422, "风扇转速需要 0–100 的整数")
+        msg = need("env").set_manual(fan, humid)
         return {"msg": msg, "env": need("env").status()}
 
     # ---------------- 演示注入 ----------------
@@ -405,9 +440,9 @@ def create_app(engine) -> FastAPI:
     async def jepa_score(request: Request):
         data = await body(request)
         try:
-            score = float(data["score"])
-        except (KeyError, TypeError, ValueError):
-            raise HTTPException(400, "需要数值 score")
+            score = _number(data["score"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise HTTPException(400, "需要有限数值 score")
         need("jepa").push(score, str(data.get("note", ""))[:200], str(data.get("model", ""))[:80])
         return {"ok": True}
 
@@ -466,7 +501,9 @@ def _port_free(host: str, port: int) -> bool:
 
 
 def _pick_port(host: str, port: int, tries: int = 20) -> Optional[int]:
-    for p in range(port, port + tries):
+    if not 1 <= port <= 65535:
+        return None
+    for p in range(port, min(port + tries, 65536)):
         if _port_free(host, p):
             return p
     return None
@@ -485,7 +522,7 @@ def start_server(engine) -> Optional[threading.Thread]:
     host, want = str(cfg("web.host", "0.0.0.0")), int(cfg("web.port", 8080))
     port = _pick_port(host, want)
     if port is None:
-        print(f"[Web] 端口 {want}–{want + 19} 都被占用，总后台未启动。请在 config.yaml → web.port 换一个端口")
+        print(f"[Web] 端口 {want}–{min(want + 19, 65535)} 不可用，总后台未启动。请在 config.yaml → web.port 设置 1–65535 的可用端口")
         return None
     if port != want:
         print(f"[Web] 端口 {want} 已被其他程序占用（例如 Dify / Docker），自动改用 {port}")

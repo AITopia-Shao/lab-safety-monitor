@@ -169,24 +169,26 @@ class SafetyEngine(QObject):
     def latest_jpeg(self, which: str = "pano", width: Optional[int] = None, quality: int = 70) -> Optional[bytes]:
         """返回最新带框画面的 JPEG（同一帧只编码一次）"""
         import cv2
+        width = max(1, int(width or cfg("web.stream_width", 640)))
+        quality = max(1, min(100, int(quality)))
         with self._lock:
             seq = self._frame_seq
             frame = self._frames[0 if which == "pano" else 1]
             cached = self._jpeg_cache.get(which)
         if frame is None:
             return None
-        if cached and cached[0] == seq:
+        cache_key = (seq, width, quality)
+        if cached and cached[0] == cache_key:
             return cached[1]
-        width = int(width or cfg("web.stream_width", 640))
         h, w = frame.shape[:2]
         if w > width:
-            frame = cv2.resize(frame, (width, int(h * width / w)), interpolation=cv2.INTER_AREA)
+            frame = cv2.resize(frame, (width, max(1, int(h * width / w))), interpolation=cv2.INTER_AREA)
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
         if not ok:
             return None
         data = buf.tobytes()
         with self._lock:
-            self._jpeg_cache[which] = (seq, data)
+            self._jpeg_cache[which] = (cache_key, data)
         return data
 
     @property
@@ -226,6 +228,7 @@ class SafetyEngine(QObject):
     def snapshot(self) -> Dict[str, Any]:
         """JSON 友好的全量状态快照（Web / 小屏 / Agent 共用）"""
         sm = self.state_machine
+        state = sm.snapshot()
         tel = telemetry.snapshot()
         link = self.serial
         alive = bool(link is not None and link.is_alive)
@@ -237,10 +240,10 @@ class SafetyEngine(QObject):
         snap = {
             "ts": time.time(),
             "uptime_s": round(time.time() - self.started_at),
-            "state": sm.current_state,
-            "state_text": "断电锁定中" if sm.latched else STATE_TEXT.get(sm.current_state, sm.current_state),
-            "latched": sm.latched,
-            "latch_reason": sm.latch_reason,
+            "state": state["state"],
+            "state_text": "断电锁定中" if state["latched"] else STATE_TEXT.get(state["state"], state["state"]),
+            "latched": state["latched"],
+            "latch_reason": state["latch_reason"],
             "power_off_state": getattr(link, "power_off_state", "idle") if link else "idle",
             "telemetry": {
                 "temp": tel.get("temp"), "humi": tel.get("humi"), "obj_temp": tel.get("obj_temp"),

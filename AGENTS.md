@@ -93,7 +93,7 @@ ESP32 ─串口→ serial_comm → sensor_worker → telemetry{temp, humi, obj_t
 - 视觉事件（`dual_inference.py`）：`ppe_goggles / ppe_coat / ppe_gloves / ppe_mask / ppe_headmask / eating / sleeping / edge_risk`，经 `voting`（3 秒窗口内 ≥60% 帧命中）确认。
 - 人员在场：PPE 模型检测到任意一类装备即视为有人（模型里没有 person 类）；连续 `presence.absent_seconds` 15 s 无检测才算无人值守。
 - 防抖：器皿识别结果保留 `rules.item_hold_s` 3 s；同类事件解除后 `events.retrigger_s` 10 s 内再出现算同一次。
-- 锁定：断电后保持 CRITICAL，直到下位机上报复位（事件码 5，或锁定标志由真变假）。没接下位机时，危险解除 `sim_latch_release_s` 10 s 后自动解锁（只用于演示）。
+- 锁定：断电后保持 CRITICAL，直到下位机上报复位（事件码 5，或锁定标志由真变假）。本次运行未接入过下位机的纯演示模式，危险解除 `sim_latch_release_s` 10 s 后自动解锁；真实下位机失联后保持锁定，不会退回演示自动解锁。
 - 等级：INFO < NOTICE < WARNING < CRITICAL。
 
 ## 6. 温度预测（`world_model.py`）
@@ -138,14 +138,18 @@ ESP32-S3 引脚：SDA 8、SCL 9、MQ-2 1、继电器 10、LED 红/黄/绿 11/12/
 cd labguard
 conda env create -f environment.yml       # 推荐：Python 3.12，电脑和开发板共用；之后 conda activate lab_safety
 pip install -r requirements.txt          # 或者不用 conda：Python 3.10–3.12
+pip install -r requirements-dev.txt      # 跑测试时补装 httpx
 python run_app.py                          # 电脑大窗口 + 网页（网址见启动窗口，默认 http://127.0.0.1:8080）
 python run_app.py --mode edge --windowed   # 在电脑上看小屏
 python tests/test_backend.py               # 41 项，无需硬件
 python tests/test_platform.py              # 39 项，无需硬件和大模型
+python -m unittest discover -s tests -p 'test_*_regressions.py' -v  # 40 项回归
+python tests/smoke_app.py                  # 三种启动模式；生成测试图片，不打开真实硬件
 python hub/jepa_worker.py --selftest       # V-JEPA 2 流程自检（需 requirements-host.txt）
 ```
 
 - 测试会在临时目录建数据库，不会动 `runtime/`。改完代码两个测试都要显示"全部通过"。
+- 回归测试里的浏览器交互检查需要 Node.js；`smoke_app.py` 使用 Qt offscreen 和本机回环端口，检查桌面、小屏、无界面模式的模型推理、网页鉴权、JPEG 与端口顺延。
 - 没有摄像头 / 下位机时：网页「参数」页播放演示视频（放在 `labguard/media/` 或仓库根的 `local_private/`）；「环境控制 → 演示数据」注入场景。
 - 开发板：`deploy/orangepi/setup.sh` 安装（默认装 Miniforge 并用 `environment.yml` 建 conda 环境；`LABGUARD_USE_VENV=1` 走系统 Python + venv），`start.sh` 自启；NPU 模型用 `tools/export_rknn.py` 在 x86 上导出。
 - 闪退排查：Python 报错和底层崩溃都记在 `runtime/crash.log`。PySide6 6.12 在 Python 3.10 / 3.11 上会闪退（界面画几秒就崩），`requirements.txt` 已限制 `<6.12`，`run_app.py` 启动时也会检查。

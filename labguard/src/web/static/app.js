@@ -20,13 +20,14 @@
   // 支持 ?token=XXXX 直接登录（小屏设置页给出的链接），读取后从地址栏去掉
   var qs = new URLSearchParams(location.search);
   if (qs.get('token')) {
-    token = qs.get('token').trim().toUpperCase();
+    token = qs.get('token').trim();
     try { localStorage.setItem('labguard_token', token); } catch (e) {}
     qs.delete('token');
     history.replaceState(null, '', location.pathname + (qs.toString() ? '?' + qs : '') + location.hash);
   }
   // ?still=1：画面改为每秒刷新一张图片（不支持 MJPEG 的浏览器 / 截图用）
   var still = qs.get('still') === '1';
+  var imagePoll = null, reconnectTimer = null;
   var snap = null, ws = null, heatHist = [], evCache = [], evFilter = 'all', chatHist = [];
 
   // ---------------- 通用 ----------------
@@ -52,7 +53,7 @@
   // ---------------- 登录 ----------------
   function showLogin(msg) { $('login').classList.remove('hidden'); $('loginMsg').textContent = msg || ''; }
   $('loginBtn').onclick = function () {
-    token = $('tokenInput').value.trim().toUpperCase();
+    token = $('tokenInput').value.trim();
     try { localStorage.setItem('labguard_token', token); } catch (e) {}
     $('login').classList.add('hidden'); start();
   };
@@ -73,13 +74,16 @@
 
   // ---------------- 实时推送 ----------------
   function start() {
+    clearInterval(imagePoll); imagePoll = null;
+    clearTimeout(reconnectTimer); reconnectTimer = null;
+    if (ws) { var old = ws; ws = null; old.close(); }
     var t = encodeURIComponent(token);
     if (still) {
       var poll = function () {
         $('imgPano').src = '/api/frame/pano.jpg?token=' + t + '&_=' + Date.now();
         $('imgDesk').src = '/api/frame/desk.jpg?token=' + t + '&_=' + Date.now();
       };
-      poll(); setInterval(poll, 1000);
+      poll(); imagePoll = setInterval(poll, 1000);
     } else {
       $('imgPano').src = '/stream/pano.mjpg?token=' + t;
       $('imgDesk').src = '/stream/desk.mjpg?token=' + t;
@@ -91,12 +95,18 @@
   }
   function connectWs() {
     var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-    ws = new WebSocket(proto + location.host + '/ws?token=' + encodeURIComponent(token));
-    ws.onmessage = function (m) { try { render(JSON.parse(m.data)); } catch (e) { console.error(e); } };
-    ws.onclose = function (e) {
-      if (e.code === 4401) { showLogin('口令错误'); return; }
+    var socket = new WebSocket(proto + location.host + '/ws?token=' + encodeURIComponent(token));
+    ws = socket;
+    socket.onmessage = function (m) {
+      if (ws !== socket) return;
+      try { render(JSON.parse(m.data)); } catch (e) { console.error(e); }
+    };
+    socket.onclose = function (e) {
+      if (ws !== socket) return;
+      ws = null;
+      if (e.code === 4401) { clearInterval(imagePoll); imagePoll = null; showLogin('口令错误'); return; }
       $('heroState').textContent = '与边缘节点断开，重连中…';
-      setTimeout(connectWs, 2000);
+      reconnectTimer = setTimeout(function () { reconnectTimer = null; connectWs(); }, 2000);
     };
   }
 

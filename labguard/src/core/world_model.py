@@ -101,7 +101,13 @@ class ThermalWorldModel:
 
         win = self._window(now, float(cfg("world_model.fit_window_s", 60.0)))
         if len(win) < 6 or win[-1][0] - win[0][0] < 8.0:
-            out["phase"] = "warming_up" if temp >= heat_on else "idle"
+            # 新接入或长时间没有数据后重新采样，不把失联时长算作连续沸腾。
+            self._plateau_since = None
+            if temp >= dry_c:
+                out.update({"phase": "overheat", "risk": 1.0,
+                            "eta_s": 0.0, "will_dry_burn": True})
+            else:
+                out["phase"] = "warming_up" if temp >= heat_on else "idle"
             return out
 
         # 斜率：最近窗口线性拟合（℃/s）
@@ -117,9 +123,10 @@ class ThermalWorldModel:
         if boil_lo <= temp <= boil_hi and abs(slope_short) < 0.05:
             if self._plateau_since is None:
                 self._plateau_since = now
-        elif temp < boil_lo - 3 or temp > boil_hi + 2 or slope_short > 0.15:
+        elif (temp < boil_lo - 3 or temp > boil_hi + 2
+              or slope_short < -0.05 or slope_short > 0.15):
             self._plateau_since = None
-        plateau_s = (now - self._plateau_since) if self._plateau_since else 0.0
+        plateau_s = (now - self._plateau_since) if self._plateau_since is not None else 0.0
         out["plateau_s"] = round(plateau_s, 1)
         # 越过沸点后是"液体烧干后的新一段升温"，60 秒窗口里混着前面的沸腾平台，只用最近 15 秒外推
         beyond_boil = temp >= boil_hi

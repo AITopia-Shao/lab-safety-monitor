@@ -49,14 +49,17 @@ def control_law(temp: Optional[float], humi: Optional[float], smoke: Optional[in
         if humi > h_high:
             humid = False
     if humid:
-        reasons.append(f"湿度 {humi:.0f}% 低于下限 {h_low:.0f}%：加湿")
+        if humi is None:
+            reasons.append("湿度数据暂缺，保持原加湿状态")
+        else:
+            reasons.append(f"湿度 {humi:.0f}% 低于下限 {h_low:.0f}%：加湿")
     return fan, humid, "；".join(reasons) if reasons else "环境正常，执行器待机"
 
 
 class EnvController:
     def __init__(self, serial_link=None):
         self.serial = serial_link
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.fan_pwm = 0
         self.humid_on = False
         self.reason = "等待遥测"
@@ -77,29 +80,34 @@ class EnvController:
 
     @property
     def manual(self) -> bool:
-        return time.time() < self.manual_until
+        with self._lock:
+            return time.time() < self.manual_until
 
     def tick(self):
         """引擎每秒调用一次"""
-        t_set, h_low, h_high, smoke_fan = self._params()
-        hw = self._hw()
         with self._lock:
+            t_set, h_low, h_high, smoke_fan = self._params()
+            hw = self._hw()
             if hw is not None:
                 sp = (t_set, h_low, h_high, self.manual)
                 if sp != self._sent_setpoint and hasattr(self.serial, "set_env"):
-                    self.serial.set_env(1 if self.manual else 0, t_set, h_low, h_high)
-                    self._sent_setpoint = sp
+                    if self.serial.set_env(1 if self.manual else 0, t_set, h_low, h_high):
+                        self._sent_setpoint = sp
                 if hw.get("fan_pwm") is not None:
                     self.fan_pwm = int(hw.get("fan_pwm") or 0)
                     self.humid_on = bool(hw.get("humid_on"))
                     self.reason = "下位机本地闭环控制" + ("（手动）" if self.manual else "")
                 return
             self._sent_setpoint = None
+            snap = telemetry.snapshot()
+            if snap.get("smoke") is not None and snap["smoke"] >= smoke_fan:
+                self.fan_pwm, self.humid_on = 100, False
+                self.reason = "烟雾超标：排风满速，禁止加湿"
+                return
             if self.manual:
                 self.fan_pwm, self.humid_on = self._manual
                 self.reason = "总后台手动控制"
                 return
-            snap = telemetry.snapshot()
             self.fan_pwm, self.humid_on, self.reason = control_law(
                 snap.get("temp"), snap.get("humi"), snap.get("smoke"),
                 t_set, h_low, h_high, smoke_fan, self.fan_pwm, self.humid_on)
@@ -110,31 +118,33 @@ class EnvController:
             raise ValueError("温度设定需在 15–35℃")
         if not (20 <= h_low <= 60 and 50 <= h_high <= 90 and h_high - h_low >= 10):
             raise ValueError("湿度下限 20–60%、上限 50–90%，且上限比下限至少高 10%")
-        set_value("env.t_set_c", t_set)
-        set_value("env.h_low", h_low)
-        set_value("env.h_high", h_high)
+        with self._lock:
+            set_value("env.t_set_c", t_set)
+            set_value("env.h_low", h_low)
+            set_value("env.h_high", h_high)
         self.tick()
         return "设定值已更新"
 
     def set_manual(self, fan_pwm: Optional[int], humid: Optional[bool]) -> str:
         """手动控制；fan_pwm 为 None 表示恢复自动"""
         if fan_pwm is None:
-            self.manual_until = 0.0
-            if self._hw() is not None and hasattr(self.serial, "set_env"):
+            with self._lock:
+                self.manual_until = 0.0
                 self._sent_setpoint = None
             self.tick()
             return "已恢复自动控制"
         fan_pwm = max(0, min(100, int(fan_pwm)))
-        self._manual = (fan_pwm, bool(humid))
-        self.manual_until = time.time() + float(cfg("env.manual_timeout_s", 600.0))
-        if self._hw() is not None and hasattr(self.serial, "set_actuator"):
-            self.serial.set_actuator(fan_pwm, bool(humid))
+        with self._lock:
+            self._manual = (fan_pwm, bool(humid))
+            self.manual_until = time.time() + float(cfg("env.manual_timeout_s", 600.0))
+            if self._hw() is not None and hasattr(self.serial, "set_actuator"):
+                self.serial.set_actuator(fan_pwm, bool(humid))
         self.tick()
         return f"手动控制 {cfg('env.manual_timeout_s', 600) / 60:.0f} 分钟后自动恢复"
 
     def status(self) -> Dict[str, Any]:
-        t_set, h_low, h_high, smoke_fan = self._params()
         with self._lock:
+            t_set, h_low, h_high, smoke_fan = self._params()
             return {"mode": "manual" if self.manual else "auto",
                     "manual_left_s": max(0, round(self.manual_until - time.time())) if self.manual else 0,
                     "t_set": t_set, "h_low": h_low, "h_high": h_high,

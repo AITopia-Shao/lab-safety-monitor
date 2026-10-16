@@ -8,6 +8,7 @@ for %%D in ("%USERPROFILE%\miniforge3" "%USERPROFILE%\miniconda3" "%USERPROFILE%
     if exist "%%~D\envs\lab_safety\python.exe" set "PY=%%~D\envs\lab_safety\python.exe"
 )
 if exist "%CONDA_PREFIX%\envs\lab_safety\python.exe" set "PY=%CONDA_PREFIX%\envs\lab_safety\python.exe"
+if "%PY%"=="python" if exist ".venv\Scripts\python.exe" set "PY=%CD%\.venv\Scripts\python.exe"
 echo 使用的 Python：%PY%
 "%PY%" run_app.py %*
 if %errorlevel% neq 0 (

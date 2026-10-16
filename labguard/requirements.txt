@@ -4,7 +4,7 @@
 #
 # 香橙派上 NPU 推理还需要安装 rknn-toolkit-lite2（不在 PyPI 上，见 deploy/orangepi/setup.sh）
 
-PySide6>=6.5.0              # 界面（代码会在缺少 PySide6 时自动回退到 PyQt6）
+PySide6>=6.5.0,<6.12        # 界面（缺少时自动回退到 PyQt6）。6.12 在 Python 3.10/3.11 上会让界面闪退
 opencv-python-headless>=4.8.0
 ultralytics>=8.3.0          # 8.3 起支持 RKNN 模型导出与推理
 numpy>=1.24.0,<2.0.0        # numpy<2 没有 Python 3.13 安装包，请使用 3.10~3.12

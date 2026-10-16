@@ -27,8 +27,56 @@ for p in (project_root, os.path.join(project_root, "LabSafetyMonitor"), os.path.
     if p not in sys.path:
         sys.path.insert(0, p)
 
+# 3. Windows 控制台默认 GBK：遇到打不出来的字符时替换掉，不要因为一句 print 闪退
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
+# 4. 闪退记录：Python 报错和底层崩溃（C 扩展段错误等）都写进 runtime/crash.log，方便事后排查
+CRASH_LOG = os.path.join(project_root, "runtime", "crash.log")
+
+
+def _install_crash_log():
+    import faulthandler
+    import time
+    import traceback
+    try:
+        os.makedirs(os.path.dirname(CRASH_LOG), exist_ok=True)
+        f = open(CRASH_LOG, "a", encoding="utf-8", buffering=1)
+        f.write(f"\n===== 启动 {time.strftime('%Y-%m-%d %H:%M:%S')}  Python {sys.version.split()[0]} =====\n")
+        faulthandler.enable(file=f, all_threads=True)
+    except OSError:
+        faulthandler.enable()
+        return
+
+    def hook(exc_type, exc, tb):
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        f.write(text)
+        sys.__stderr__.write(text)
+        sys.__stderr__.write(f"\n[启动失败] 错误详情已保存到 {CRASH_LOG}\n")
+
+    sys.excepthook = hook
+
+
+def _check_qt_version():
+    """PySide6 6.12 在 Python 3.10 / 3.11 上有引用计数错误，界面画几秒就会闪退（Python 3.12 起不受影响）"""
+    try:
+        import PySide6
+    except ImportError:
+        return
+    ver = tuple(int(x) for x in PySide6.__version__.split(".")[:2])
+    if ver >= (6, 12) and sys.version_info < (3, 12):
+        print(f"[启动失败] 当前 PySide6 {PySide6.__version__} + Python {sys.version.split()[0]} 会让界面闪退。\n"
+              f"  请执行：pip install \"PySide6>=6.5,<6.12\"\n"
+              f"  或者改用 Python 3.12（推荐用 conda：conda env create -f environment.yml）")
+        sys.exit(2)
+
 
 def main():
+    _install_crash_log()
+    _check_qt_version()
     ap = argparse.ArgumentParser(description="实验室安全事前干预监测系统")
     ap.add_argument("--mode", choices=["desktop", "edge", "headless"], default="desktop")
     ap.add_argument("--no-web", action="store_true", help="不启动 Web 总后台")
@@ -51,8 +99,12 @@ def main():
     engine = attach_extensions(SafetyEngine())
 
     if not args.no_web:
-        from src.web.server import start_server
-        start_server(engine)
+        try:
+            from src.web.server import start_server
+        except ImportError as e:   # 缺 fastapi 等网页依赖时只关掉网页，安全核心和界面照常运行
+            print(f"[Web] 网页依赖没装全（{e}），总后台未启动。请执行：pip install fastapi uvicorn")
+        else:
+            start_server(engine)
 
     window = None
     if args.mode == "desktop":

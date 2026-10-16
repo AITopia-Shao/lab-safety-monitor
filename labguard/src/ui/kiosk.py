@@ -393,8 +393,8 @@ class KioskWindow(QWidget):
         for j, b in enumerate(self.tab_btns):
             b.setChecked(j == i)
         if i == 3:
-            from src.web.server import web_token
-            port = int(cfg("web.port", 8080))
+            from src.web.server import web_token, web_port
+            port = web_port()
             self.set_lbl.setText(f"浏览器打开：\nhttp://{_local_ip()}:{port}\n\n口令：{web_token()}\n\n"
                                  f"大屏可查看两路画面、调整参数，使用安全助手、温度预测和环境控制。")
 

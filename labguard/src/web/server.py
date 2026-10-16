@@ -16,6 +16,7 @@ import glob
 import json
 import os
 import secrets
+import socket
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -413,8 +414,67 @@ def create_app(engine) -> FastAPI:
     return app
 
 
+# 实际使用的端口：配置的端口被别的程序（如 Dify、Docker）占用时会自动往后顺延
+_web_port: Optional[int] = None
+
+
+def web_port() -> int:
+    return _web_port or int(cfg("web.port", 8080))
+
+
+def local_ips():
+    """本机局域网 IPv4 地址（不含 127.0.0.1）；网线 / Wi-Fi 都没连时返回空列表"""
+    ips = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))        # UDP 不会真的发包，只用来查出默认网卡的地址
+        ips.append(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if ip not in ips:
+                ips.append(ip)
+    except OSError:
+        pass
+    return [ip for ip in ips if not ip.startswith("127.")]
+
+
+def web_urls():
+    port = web_port()
+    return [f"http://127.0.0.1:{port}"] + [f"http://{ip}:{port}" for ip in local_ips()]
+
+
+def _port_free(host: str, port: int) -> bool:
+    # 先看本机这个端口有没有程序在应答：Docker（Dify 等）有时只占 127.0.0.1，单纯试绑 0.0.0.0 查不出来
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+            return False
+    except OSError:
+        pass
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if os.name != "nt":   # 与 uvicorn 一致；Windows 上这个选项含义不同，会把占用的端口也判成可用
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _pick_port(host: str, port: int, tries: int = 20) -> Optional[int]:
+    for p in range(port, port + tries):
+        if _port_free(host, p):
+            return p
+    return None
+
+
 def start_server(engine) -> Optional[threading.Thread]:
     """在后台线程启动 uvicorn；失败只打印，不影响安全主循环"""
+    global _web_port
     if not bool(cfg("web.enabled", True)):
         return None
     try:
@@ -422,12 +482,31 @@ def start_server(engine) -> Optional[threading.Thread]:
     except ImportError:
         print("[Web] 未安装 fastapi / uvicorn，总后台未启动（pip install fastapi uvicorn）")
         return None
+    host, want = str(cfg("web.host", "0.0.0.0")), int(cfg("web.port", 8080))
+    port = _pick_port(host, want)
+    if port is None:
+        print(f"[Web] 端口 {want}–{want + 19} 都被占用，总后台未启动。请在 config.yaml → web.port 换一个端口")
+        return None
+    if port != want:
+        print(f"[Web] 端口 {want} 已被其他程序占用（例如 Dify / Docker），自动改用 {port}")
+    _web_port = port
     app = create_app(engine)
-    host, port = str(cfg("web.host", "0.0.0.0")), int(cfg("web.port", 8080))
     config = uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False)
     server = uvicorn.Server(config)
     server.install_signal_handlers = lambda: None   # 在子线程运行，信号交给 Qt 主线程
     t = threading.Thread(target=server.run, name="WebServer", daemon=True)
     t.start()
-    print(f"[Web] 总后台已启动：http://{'<本机IP>' if host == '0.0.0.0' else host}:{port}  口令 {web_token()}")
+
+    urls = web_urls() if host == "0.0.0.0" else [f"http://{host}:{port}"]
+    tok = web_token()
+    lines = [f"[Web] 总后台已启动，口令 {tok}。用浏览器打开："]
+    lines += [f"        {u}/?token={tok}" + ("    （本机）" if "127.0.0.1" in u else "    （同一局域网的其他设备）")
+              for u in urls]
+    print("\n".join(lines))
+    try:
+        path = resolve_path(os.path.join("runtime", "web_url.txt"))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(urls) + "\n")
+    except OSError:
+        pass
     return t

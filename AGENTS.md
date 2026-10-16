@@ -125,6 +125,8 @@ ESP32-S3 引脚：SDA 8、SCL 9、MQ-2 1、继电器 10、LED 红/黄/绿 11/12/
 
 ## 8. 网页大屏接口（`src/web/server.py`，默认端口 8080）
 
+- 端口被占用（如 Dify / Docker）时自动顺延到 8081、8082……；实际网址打印在启动窗口里，并写入 `runtime/web_url.txt`。`web_port()` 返回实际端口。
+
 - 除 `/`、`/static/*`、`/font/*`、`/api/ping` 外都要口令：请求头 `X-Token` 或 `?token=`。口令为 `web.token`，留空则自动生成并写入 `runtime/web_token.txt`。
 - 只读：`GET /api/snapshot`、`WS /ws`（2 Hz 推送 snapshot + 最近事件）、`GET /api/events`、`GET /api/events/{uid}/snapshot.jpg`、`GET /stream/{pano|desk}.mjpg`、`GET /api/frame/{pano|desk}.jpg`、`GET /api/config`、`/api/models`、`/api/media`、`/api/agent`、`/api/env`、`/api/demo`。
 - 写：`PATCH /api/config`（仅 `TUNABLE` 白名单 + 范围校验）、`POST /api/model`、`/api/camera`、`/api/power/cut`（需 `{"confirm": true}`，**只能断电**）、`/api/mute`、`/api/events/{uid}/review`、`/api/manual_snapshot`、`/api/agent/config|test|ask|report`、`/api/events/{uid}/agent`、`/api/env/setpoint|manual`、`/api/demo/start|stop`、`/api/jepa/score`。
@@ -134,8 +136,9 @@ ESP32-S3 引脚：SDA 8、SCL 9、MQ-2 1、继电器 10、LED 红/黄/绿 11/12/
 
 ```bash
 cd labguard
-pip install -r requirements.txt          # Python 3.10–3.12
-python run_app.py                          # 电脑大窗口 + 网页 http://127.0.0.1:8080
+conda env create -f environment.yml       # 推荐：Python 3.12，电脑和开发板共用；之后 conda activate lab_safety
+pip install -r requirements.txt          # 或者不用 conda：Python 3.10–3.12
+python run_app.py                          # 电脑大窗口 + 网页（网址见启动窗口，默认 http://127.0.0.1:8080）
 python run_app.py --mode edge --windowed   # 在电脑上看小屏
 python tests/test_backend.py               # 41 项，无需硬件
 python tests/test_platform.py              # 39 项，无需硬件和大模型
@@ -144,7 +147,9 @@ python hub/jepa_worker.py --selftest       # V-JEPA 2 流程自检（需 require
 
 - 测试会在临时目录建数据库，不会动 `runtime/`。改完代码两个测试都要显示"全部通过"。
 - 没有摄像头 / 下位机时：网页「参数」页播放演示视频（放在 `labguard/media/` 或仓库根的 `local_private/`）；「环境控制 → 演示数据」注入场景。
-- 开发板：`deploy/orangepi/setup.sh` 安装，`start.sh` 自启；NPU 模型用 `tools/export_rknn.py` 在 x86 上导出。
+- 开发板：`deploy/orangepi/setup.sh` 安装（默认装 Miniforge 并用 `environment.yml` 建 conda 环境；`LABGUARD_USE_VENV=1` 走系统 Python + venv），`start.sh` 自启；NPU 模型用 `tools/export_rknn.py` 在 x86 上导出。
+- 闪退排查：Python 报错和底层崩溃都记在 `runtime/crash.log`。PySide6 6.12 在 Python 3.10 / 3.11 上会闪退（界面画几秒就崩），`requirements.txt` 已限制 `<6.12`，`run_app.py` 启动时也会检查。
+- `.sh` 必须是 LF 换行、`.bat` 用 CRLF（`.gitattributes` 已规定），否则开发板上的脚本会报 `$'\r': command not found`。
 
 ## 10. 常见问题去哪找
 
@@ -162,6 +167,7 @@ python hub/jepa_worker.py --selftest       # V-JEPA 2 流程自检（需 require
 | 固件引脚、本地规则 | `firmware/lab_guard_esp32/lab_guard_esp32.ino` 顶部常量 |
 | 采购清单、硬件接线 | `docs/开发记录/修改说明与落地计划.md` 第 3、4 节 |
 | 早期代码审查结论 | `docs/开发记录/代码审查与改进方案.md` |
+| 评委视角的问题清单和瘦身计划（待执行） | `docs/开发记录/评委视角审查与瘦身计划.md` |
 | 旧版本代码 | git 标签 `v1-prototype`（最初原型）、`v2-before-restructure`（整理目录前） |
 
 ## 11. 代码约定

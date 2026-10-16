@@ -1,14 +1,24 @@
+# conda 环境：电脑（Windows / x86 Linux）和开发板（RK3588，aarch64）共用一份
+#   创建：conda env create -f environment.yml
+#   更新：conda env update -f environment.yml --prune
+#   开发板上用 deploy/orangepi/setup.sh 会自动装 Miniforge 并创建这个环境，再补装 NPU 运行库
+#
+# 为什么用 conda：
+#   · Python 版本固定为 3.12，电脑和开发板一致，不受系统自带 Python 影响
+#   · 界面库 PySide6 从 conda-forge 装，自带 Qt。pip 上的新版 PySide6 在开发板的
+#     Ubuntu 22.04 上装不了（要求更新的 glibc），conda-forge 的可以
 name: lab_safety
 channels:
   - conda-forge
-  - defaults
 dependencies:
-  - python=3.10
+  - python=3.12
   - pip
-  - numpy>=1.24.0,<2.0.0
+  - pyside6>=6.5,<6.12      # 6.12 在 Python 3.10/3.11 上会闪退；这里虽然是 3.12，也一并避开
+  - numpy>=1.24,<2.0
   - pyserial>=3.5
   - pyyaml>=6.0
+  - fastapi>=0.110          # 网页大屏
+  - uvicorn>=0.29
   - pip:
-      - PySide6>=6.5.0
       - opencv-python-headless>=4.8.0
-      - ultralytics>=8.3.0
+      - ultralytics>=8.3.0  # 会顺带装 PyTorch（CPU 版）

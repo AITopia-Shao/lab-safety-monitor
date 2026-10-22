@@ -1,0 +1,230 @@
+{
+  "schema_version": 2,
+  "building": {
+    "id": "building-a",
+    "name": "实验楼 A"
+  },
+  "rules": {
+    "unattended_seconds": 5.0,
+    "freshness_seconds": 8.0,
+    "high_temperature": 55.0,
+    "high_humidity": 80.0
+  },
+  "fire_linkage": {
+    "targets": "all",
+    "actions": [
+      "alarm",
+      "power_off"
+    ]
+  },
+  "labs": [
+    {
+      "id": "lab-102",
+      "name": "实验室 102",
+      "macro": {
+        "id": "lab-102-macro",
+        "name": "实验室 102 · 宏观",
+        "source_kind": "simulation",
+        "source": "",
+        "model": "models/ppe_best.pt",
+        "confidence": 0.35,
+        "fps": 3,
+        "person_labels": [
+          "Person",
+          "Head",
+          "Drinking",
+          "Eating",
+          "Gloves",
+          "Googles",
+          "Head Mask",
+          "Lab Coat",
+          "Mask",
+          "No Gloves",
+          "No Head Mask",
+          "No Lab coat",
+          "No Mask",
+          "No googles"
+        ],
+        "heating_labels": [
+          "Alcohol lamp",
+          "Alcohol_lamp",
+          "burner",
+          "hotplate",
+          "heater",
+          "酒精灯",
+          "加热板"
+        ],
+        "fire_labels": [
+          "fire",
+          "flame",
+          "smoke",
+          "火焰",
+          "烟雾"
+        ]
+      },
+      "benches": [
+        {
+          "id": "bench-911dc7ab",
+          "name": "实验台 2",
+          "camera": {
+            "id": "bench-911dc7ab-micro",
+            "name": "实验台 2 · 微观",
+            "source_kind": "simulation",
+            "source": "",
+            "model": "models/chem_best.pt",
+            "confidence": 0.35,
+            "fps": 3,
+            "person_labels": [
+              "Person",
+              "Head",
+              "Drinking",
+              "Eating",
+              "Gloves",
+              "Googles",
+              "Head Mask",
+              "Lab Coat",
+              "Mask",
+              "No Gloves",
+              "No Head Mask",
+              "No Lab coat",
+              "No Mask",
+              "No googles"
+            ],
+            "heating_labels": [
+              "Alcohol lamp",
+              "Alcohol_lamp",
+              "burner",
+              "hotplate",
+              "heater",
+              "酒精灯",
+              "加热板"
+            ],
+            "fire_labels": [
+              "fire",
+              "flame",
+              "smoke",
+              "火焰",
+              "烟雾"
+            ]
+          },
+          "telemetry": {
+            "kind": "simulation",
+            "port": "",
+            "baudrate": 9600,
+            "temperature": 25.0,
+            "humidity": 55.0
+          }
+        }
+      ],
+      "actuator": {
+        "mode": "simulation",
+        "port": "",
+        "baudrate": 115200
+      }
+    },
+    {
+      "id": "lab-11e21b93",
+      "name": "新实验室 2",
+      "macro": {
+        "id": "lab-11e21b93-macro",
+        "name": "新实验室 2 · 宏观",
+        "source_kind": "simulation",
+        "source": "",
+        "model": "models/ppe_best.pt",
+        "confidence": 0.35,
+        "fps": 3,
+        "person_labels": [
+          "Person",
+          "Head",
+          "Drinking",
+          "Eating",
+          "Gloves",
+          "Googles",
+          "Head Mask",
+          "Lab Coat",
+          "Mask",
+          "No Gloves",
+          "No Head Mask",
+          "No Lab coat",
+          "No Mask",
+          "No googles"
+        ],
+        "heating_labels": [
+          "Alcohol lamp",
+          "Alcohol_lamp",
+          "burner",
+          "hotplate",
+          "heater",
+          "酒精灯",
+          "加热板"
+        ],
+        "fire_labels": [
+          "fire",
+          "flame",
+          "smoke",
+          "火焰",
+          "烟雾"
+        ]
+      },
+      "benches": [
+        {
+          "id": "lab-11e21b93-bench-1",
+          "name": "实验台 1",
+          "camera": {
+            "id": "lab-11e21b93-bench-1-micro",
+            "name": "实验台 1 · 微观",
+            "source_kind": "simulation",
+            "source": "",
+            "model": "models/chem_best.pt",
+            "confidence": 0.35,
+            "fps": 3,
+            "person_labels": [
+              "Person",
+              "Head",
+              "Drinking",
+              "Eating",
+              "Gloves",
+              "Googles",
+              "Head Mask",
+              "Lab Coat",
+              "Mask",
+              "No Gloves",
+              "No Head Mask",
+              "No Lab coat",
+              "No Mask",
+              "No googles"
+            ],
+            "heating_labels": [
+              "Alcohol lamp",
+              "Alcohol_lamp",
+              "burner",
+              "hotplate",
+              "heater",
+              "酒精灯",
+              "加热板"
+            ],
+            "fire_labels": [
+              "fire",
+              "flame",
+              "smoke",
+              "火焰",
+              "烟雾"
+            ]
+          },
+          "telemetry": {
+            "kind": "simulation",
+            "port": "",
+            "baudrate": 9600,
+            "temperature": 25.0,
+            "humidity": 55.0
+          }
+        }
+      ],
+      "actuator": {
+        "mode": "simulation",
+        "port": "",
+        "baudrate": 115200
+      }
+    }
+  ]
+}

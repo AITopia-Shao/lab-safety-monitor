@@ -8,6 +8,17 @@
 
 化学实验室安全监测终端（第 22 届计算机设计大赛·嵌入式赛道，湖南涉外经济学院 3 队）。两个 USB 摄像头 + YOLO11 识别人员装备和台面器皿；ESP32 下位机采集温湿度 / 红外测温 / 烟雾并控制加热继电器；开发板（RK3588，Python）把识别结果和传感器数据交给规则判断，危险时让下位机断电。另有实验台小屏、网页大屏、安全助手（大模型）、温度预测、外部温湿度控制，以及可选的 V-JEPA 2 画面异常检测。
 
+## 1.1 分层扩展（2026-10-22）
+
+- `python run_app.py --hierarchy` 单独打开楼宇母系统；原 desktop/edge/headless 和它们的现有功能保持独立，不自动叠加运行。
+- 拓扑图位于 `labguard/config/hierarchy.json`，文件位置和状态目录通过 `cfg("hierarchy.topology_file")`、`cfg("hierarchy.state_dir")` 读取，默认值同时定义于 `src/config.py` 和 `config.yaml`。
+- `src/hierarchy/coordinator.py` 包含 MicroAgent、LaboratoryAgent、BuildingCoordinator；分层安全判断同样独立于 UI，不替换原 `SafetyEngine` 的 R1–R9。
+- `src/hierarchy/vision.py` 提供多路输入与共享模型池；`runtime.py` 管理线程、独占状态目录和异步执行。真实执行使用既有 SerialComm CRC16/ACK 协议与显式目标端口，不得恢复早期五字节原型协议。
+- `src/ui/hierarchy_window.py` 是独立新增界面，支持拓扑、演练、联动与回执。原界面样式不改。
+- 演练事件不得操作真实串口；真实执行器实验室禁止配置模拟视觉/温湿度。分层事件由主入口提供的 sink 同步到统一 `events.log()`，JSONL 只是楼宇指令审计与恢复记录。
+- 宏观掉线不得等于无人值守；各实验台证据隔离；指令按事件/目标/动作去重。无通电接口，人工确认与模拟记录清理不恢复供电。
+- 新增测试：`test_hierarchy.py` 和 `test_hierarchy_gui.py`。完整指南见 `docs/分层系统升级说明与操作教程.md`。
+
 ## 2. 不可违反的设计约束（改代码前必读）
 
 1. **软件只能断电，不能通电。** 代码里不存在任何"通电 / 解锁继电器"的接口；恢复供电只能现场长按控制盒复位键，下位机复查温度和烟雾后才通电。`tests/test_platform.py` 会检查网页路由里没有 power/on、unlock、reset、release 之类的接口。

@@ -145,3 +145,8 @@ env:
 # ---- 画面异常检测（电脑端 V-JEPA 2，可选）----
 jepa:
   surprise_threshold: 0 # 异常度（偏离正常画面的标准差倍数）超过它记一条提醒；0 = 只显示不记事件。建议先观察一段时间再填，如 4
+
+# 分层母系统：拓扑（每实验室一路宏观、多路微观）和独立运行状态目录
+hierarchy:
+  topology_file: config/hierarchy.json
+  state_dir: runtime/hierarchy

@@ -12,6 +12,7 @@ ultralytics_datas, ultralytics_binaries, ultralytics_hiddenimports = collect_all
 datas = [
     ('models/chem_best.pt', 'models'),
     ('models/ppe_best.pt', 'models'),
+    ('config/hierarchy.json', 'config'),
     ('LabSafetyMonitor/Zpix.ttf', 'LabSafetyMonitor'),
     ('LabSafetyMonitor/NerdFontSymbols.ttf', 'LabSafetyMonitor'),
     ('config.yaml', '.'),

@@ -33,3 +33,8 @@ desktop.ini
 
 # ---- 演示视频（体积大）----
 labguard/media/
+
+# macOS 独立环境、缓存与启动日志
+.venv-macos/
+.venv-macos.backup-*/
+.macos-runtime/

@@ -81,7 +81,12 @@ def main():
     ap.add_argument("--mode", choices=["desktop", "edge", "headless"], default="desktop")
     ap.add_argument("--no-web", action="store_true", help="不启动 Web 总后台")
     ap.add_argument("--windowed", action="store_true", help="小屏界面以窗口方式运行（调试用）")
+    ap.add_argument("--hierarchy", action="store_true", help="打开实验楼分层母系统（独立桌面模式）")
+    ap.add_argument("--hierarchy-config", help="指定分层拓扑 JSON")
+    ap.add_argument("--hierarchy-state-dir", help="指定分层事件运行目录")
     args = ap.parse_args()
+    if args.hierarchy and args.mode != "desktop":
+        ap.error("--hierarchy 当前仅支持桌面模式；原 edge/headless 模式保持独立")
 
     if args.mode == "headless":
         try:
@@ -94,6 +99,22 @@ def main():
         except ImportError:
             from PyQt6.QtWidgets import QApplication as App
     app = App(sys.argv)
+
+    if args.hierarchy:
+        from src.config import cfg, resolve_path
+        from src.core.events import events
+        from src.ui.hierarchy_window import HierarchyWindow
+
+        def audit(record):
+            events.log(title="分层系统：" + record.get("title", record["kind"]),
+                       message=record.get("detail", record.get("message", "")),
+                       level="INFO", kind="hierarchy_" + record["kind"].lower(), details=record)
+
+        path = args.hierarchy_config or resolve_path(cfg("hierarchy.topology_file"))
+        state = args.hierarchy_state_dir or resolve_path(cfg("hierarchy.state_dir"))
+        window = HierarchyWindow(path, state, event_sink=audit)
+        window.show()
+        sys.exit(app.exec())
 
     from src.core.engine import SafetyEngine, attach_extensions
     engine = attach_extensions(SafetyEngine())

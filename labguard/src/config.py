@@ -17,6 +17,7 @@ import tempfile
 from typing import Any
 
 DEFAULTS = {
+    "hierarchy": {"topology_file": "config/hierarchy.json", "state_dir": "runtime/hierarchy"},
     "serial": {"port": "auto", "baudrate": 115200, "heartbeat_s": 1.0},
     "camera": {"pano": 0, "desk": 0, "width": 640, "height": 480, "fourcc": "MJPG"},
     "vision": {"prefer_format": ["rknn", "onnx", "pt"], "imgsz": 640, "conf": 0.35, "iou": 0.45, "device": "cpu"},

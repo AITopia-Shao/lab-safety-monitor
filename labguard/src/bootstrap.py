@@ -43,6 +43,9 @@ def bootstrap_env():
         if os.path.isdir(p) and p not in sys.path:
             sys.path.insert(0, p)
 
+    if os.environ.get("LAB_SAFETY_ISOLATED_ENV") == "1":
+        return
+
     # 2. 扫描候选 venv / conda 环境，追加到 sys.path 末尾（不覆盖当前环境已有的包）
     user_home = os.path.expanduser("~")
     candidate_envs = [

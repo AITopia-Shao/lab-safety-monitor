@@ -1,0 +1,15 @@
+# macOS 独立运行环境；不安装生成 Word/PPT 等开发工具。
+# 只安装一种 OpenCV，避免它与 Ultralytics 的依赖重复覆盖 cv2。
+# OpenCV 4.11 与项目要求的 NumPy 1.x 配套。
+numpy==1.26.4
+opencv-python==4.11.0.86
+PyQt6>=6.5,<7
+ultralytics==8.4.95
+torch>=2.0,<3
+torchvision>=0.15,<1
+pyserial>=3.5,<4
+Pillow>=9.5
+
+PyYAML>=6.0
+fastapi>=0.110
+uvicorn>=0.29
